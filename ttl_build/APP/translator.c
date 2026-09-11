@@ -357,6 +357,9 @@ static void host_frame(const uint8_t *r, uint8_t n)
     if(n==7 && r[3]==1 && r[4]==0 && r[5]==0) {
         /* Maintenance command: manually align the mechanism, then clear all
          * four EMM encoder origins with 0x0A/0x6D. */
+        /* A stale explicit status request must not block this recovery
+         * operation after a disconnected/reconnected motor bus. */
+        if(request.kind==2) request.kind=0;
         if(request.kind) { reply(TR_BUSY,0); return; }
         request.kind=3; request.mask=(uint8_t)((1U<<MOTOR_COUNT)-1U);
         request.enables=0; request.stops=0; request.id=0; request.step=0;
