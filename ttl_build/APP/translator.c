@@ -5,6 +5,7 @@
 
 TrMotor tr_motor[MOTOR_COUNT];
 TrDiagnostics tr_diag;
+static const uint8_t physical_id[MOTOR_COUNT] = TR_PHYSICAL_ID_INITIALIZER;
 static const int8_t direction[MOTOR_COUNT] = TR_DIRECTION_INITIALIZER;
 static const int32_t offset[MOTOR_COUNT] = TR_OFFSET_INITIALIZER;
 static uint32_t now, next_tick, group_id, bus_free_us;
@@ -13,19 +14,24 @@ static uint8_t host_rx[128], motor_rx[64];
 static uint16_t host_used, motor_used;
 static uint32_t host_byte_us, motor_byte_us;
 enum { BUS_NONE, BUS_CONTROL, BUS_CURRENT, BUS_FEEDBACK, BUS_STREAM, BUS_HOME_STOP, BUS_STARTUP };
-/* Emm_V5.h: S_VER=0 maps to the wire command 0x1F. */
 enum { EMM_S_VER=0, EMM_CMD_S_VER=0x1F };
 static struct {
     uint8_t kind, id, function, expected, value;
     uint32_t sent_us, timeout_us;
 } bus;
 static struct {
-    uint8_t kind, mask, enables, stops, id, step; /* kind: 0 none, 1 enable, 2 status, 3 reset-zero, 4 firmware */
+    uint8_t kind, mask, enables, stops, id, step;
     uint32_t since;
 } request;
 
 static void cancel_motor(TrMotor *m);
-
+static uint8_t pid(uint8_t logical_index) { return physical_id[logical_index]; }
+static uint8_t logical_from_pid(uint8_t id)
+{
+    uint8_t i;
+    for(i=0;i<MOTOR_COUNT;i++) if(physical_id[i]==id) return i;
+    return 0xFF;
+}
 static uint16_t le16(const uint8_t *p) { return (uint16_t)(p[0] | ((uint16_t)p[1] << 8)); }
 static int32_t le32s(const uint8_t *p)
 {
@@ -59,21 +65,9 @@ static bool motion_pending(void)
 static void reset_cached_origin(TrMotor *m)
 {
     cancel_motor(m);
-    m->position=0;
-    m->start_position=0;
-    m->last_sent=0;
-    m->stationary_position=0;
-    m->carry_rpm=0.0f;
-    m->holding=0;
-    m->flags=0;
-    /* Never treat telemetry from the coordinate system before 0x0A/0x6D as
-     * valid after the encoder origin changes. 0x36 and 0x3A must repopulate it. */
-    m->valid=0;
-    m->pos_us=0;
-    m->flags_us=0;
-    m->temp_us=0;
-    m->voltage_us=0;
-    m->stable_us=now;
+    m->position=0; m->start_position=0; m->last_sent=0; m->stationary_position=0;
+    m->carry_rpm=0.0f; m->holding=0; m->flags=0; m->valid=0;
+    m->pos_us=0; m->flags_us=0; m->temp_us=0; m->voltage_us=0; m->stable_us=now;
 }
 uint8_t tr_crc8(const uint8_t *p, uint16_t n)
 {
@@ -90,8 +84,6 @@ uint8_t tr_crc8(const uint8_t *p, uint16_t n)
 int64_t tr_counts_to_pulses(uint8_t i, int32_t counts)
 {
     int64_t v=((int64_t)counts-offset[i])*direction[i]*MOTOR_PULSES_PER_REV;
-    /* Legacy controller: 16384 counts/rev. Emm FD at 16 microsteps: 3200
-     * command pulses/rev. Keep the full multi-turn absolute coordinate. */
     return v < 0 ? -((-v+8192)/16384) : (v+8192)/16384;
 }
 bool tr_profile(TrProfile *p, int64_t distance, float start_rpm,
@@ -105,10 +97,6 @@ bool tr_profile(TrProfile *p, int64_t distance, float start_rpm,
     p->v0=start_rpm*(16384.0f/60.0f);
     p->v1=end_rpm*(16384.0f/60.0f);
     if(distance==0 && fabsf(p->v0)<0.01f && end_rpm==0) return true;
-    /* Legacy trajectory model: a/1024 counts per 5 kHz tick squared. The
-     * translator implements this profile itself and streams absolute FD
-     * setpoints with Emm acceleration=0, so legacy acceleration/end-speed
-     * semantics are not replaced by ZDT's different acceleration scale. */
     p->a=sign*(float)accel*(25000000.0f/1024.0f);
     vmax=sign*max_rpm*(16384.0f/60.0f);
     p->vc=vmax;
@@ -149,10 +137,6 @@ static void reply(uint8_t error, uint8_t stat_id)
     r[3]=error;
     if(stat_id) {
         n=15; m=&tr_motor[stat_id-1];
-        /* cmd_count and trap_status have no direct ZDT register because the
-         * STM32 now owns the legacy FIFO/trajectory. These two fields report
-         * the translator's real accepted-command/queue state. Physical fields
-         * below only come from actual motor telemetry. */
         put_le16(r+4,m->commands);
         r[6]=(uint8_t)(m->active || m->count);
         r[7]=(uint8_t)m->temperature;
@@ -202,13 +186,8 @@ static bool fresh(TrMotor *m)
 }
 static bool status_ready(TrMotor *m)
 {
-    bool environment;
     if(!fresh(m)) return false;
-    environment=(m->valid&8U) && now-m->voltage_us<=TR_ENVIRONMENT_US;
-    if(!environment) return false;
-    /* Some Emm/X42S firmware variants do not implement 0x39. -128 is an
-     * explicit unavailable sentinel only after the motor itself rejects 0x39;
-     * it is never invented as a temperature reading. */
+    if(!(m->valid&8U) || now-m->voltage_us>TR_ENVIRONMENT_US) return false;
     if(m->no_temperature) return true;
     return (m->valid&4U) && now-m->temp_us<=TR_ENVIRONMENT_US;
 }
@@ -237,15 +216,12 @@ static bool set_current(uint8_t kind, uint8_t i, uint8_t percent)
 {
     uint8_t c[7]={0,0x45,0x66,0,0,0,0x6B};
     uint32_t ma;
-    /* Emm Rev1.3 0x45/0x66 changes the closed-loop stall/max-current limit.
-     * svF=0 makes this a volatile per-segment translation, avoiding flash
-     * writes. The cached current is updated only after a successful ACK. */
     if(percent<1) percent=1;
     if(percent>100) percent=100;
     ma=(uint32_t)TR_FULL_CURRENT_MA*percent/100U;
     if(ma>5000U) ma=5000U;
-    c[0]=i+1; put_be16(c+4,(uint16_t)ma);
-    return send_bus(kind,i+1,0x45,4,percent,c,sizeof(c));
+    c[0]=pid(i); put_be16(c+4,(uint16_t)ma);
+    return send_bus(kind,pid(i),0x45,4,percent,c,sizeof(c));
 }
 static void accept_feedback(uint8_t i, const uint8_t *r)
 {
@@ -280,8 +256,6 @@ static void accept_feedback(uint8_t i, const uint8_t *r)
 static bool ack_ok(uint8_t fn, uint8_t status)
 {
     if(status==0x02) return true;
-    /* Emm motion commands also document 0x12/0x22 as non-error accepted
-     * states. 0x9F (reached) is handled separately before this function. */
     if((fn==0xFD || fn==0xF6) && (status==0x12 || status==0x22)) return true;
     return false;
 }
@@ -294,11 +268,14 @@ static void motor_frame(const uint8_t *r, uint8_t n)
         if(bus.kind==BUS_STREAM && r[0]==bus.id && (r[1]==bus.function || r[1]==0)) {
             bus.kind=0; bus_free_us=now+TR_BUS_GAP_US;
         } else if(bus.kind==BUS_HOME_STOP && r[0]==bus.id && (r[1]==bus.function || r[1]==0)) {
-            TrMotor *m=&tr_motor[bus.id-1];
+            i=logical_from_pid(bus.id);
             bus.kind=0; bus_free_us=now+TR_BUS_GAP_US;
-            if(m->count && m->active==2) {
-                m->head=(uint8_t)((m->head+1)%TR_QUEUE_SIZE);
-                m->count--; m->active=0; m->carry_rpm=0;
+            if(i<MOTOR_COUNT) {
+                TrMotor *m=&tr_motor[i];
+                if(m->count && m->active==2) {
+                    m->head=(uint8_t)((m->head+1)%TR_QUEUE_SIZE);
+                    m->count--; m->active=0; m->carry_rpm=0;
+                }
             }
         }
         return;
@@ -306,10 +283,12 @@ static void motor_frame(const uint8_t *r, uint8_t n)
     if(n==4 && r[0]==0 && r[1]==0xEE && r[2]==0x6B) return;
     if(!bus.kind || r[0]!=bus.id) return;
     if(r[1]!=bus.function && r[1]!=0) return;
+    i=logical_from_pid(bus.id);
+    if(i>=MOTOR_COUNT) return;
     if(bus.function==0x39 && n==4 && (r[1]==0 || r[1]==0x39) && r[2]==0xEE) {
-        TrMotor *m=&tr_motor[bus.id-1];
+        TrMotor *m=&tr_motor[i];
         m->no_temperature=1; m->temperature=-128; m->valid|=4; m->temp_us=now;
-        tr_diag.unsupported_temperature_mask|=(uint8_t)(1U<<(bus.id-1));
+        tr_diag.unsupported_temperature_mask|=(uint8_t)(1U<<i);
         if(bus.kind==BUS_CONTROL && (request.kind==1 || request.kind==3)) request.step++;
         bus.kind=0; bus_free_us=now+TR_BUS_GAP_US;
         return;
@@ -322,22 +301,15 @@ static void motor_frame(const uint8_t *r, uint8_t n)
     if(bus.function==0x42) {
         if(n!=33) return;
     } else if(n!=bus.expected) return;
-    kind=bus.kind; i=bus.id-1; value=bus.value;
+    kind=bus.kind; value=bus.value;
     elapsed=now-bus.sent_us;
     if(elapsed>tr_diag.max_bus_transaction_us) tr_diag.max_bus_transaction_us=elapsed;
     bus.kind=0; bus_free_us=now+TR_BUS_GAP_US;
     if(r[1]==0x42) {
         TrMotor *m=&tr_motor[i];
-        /* Rev1.3 Emm 0x42 response is exactly 33 bytes:
-         * [ID,42,21,15, 28 config bytes, 6B]. Require the settings that the
-         * translator's unit conversions and ACK handling depend on. */
         if(r[2]!=0x21 || r[3]!=0x15 ||
-           r[6]!=0x02 ||                    /* P_Serial = UART */
-           r[9]!=MOTOR_MICROSTEP ||         /* 16 => 3200 pulses/rev */
-           r[18]!=0x05 ||                   /* 115200 baud */
-           r[20]!=(uint8_t)(i+1) ||         /* actual ID/address */
-           r[21]!=0x00 ||                   /* checksum = fixed 0x6B */
-           (r[22]!=0x01 && r[22]!=0x03)) {  /* Receive or Both */
+           r[6]!=0x02 || r[9]!=MOTOR_MICROSTEP || r[18]!=0x05 ||
+           r[20]!=pid(i) || r[21]!=0x00 || (r[22]!=0x01 && r[22]!=0x03)) {
             fail(TR_CONFIG); return;
         }
         memcpy(m->config_raw,r+4,sizeof(m->config_raw));
@@ -349,9 +321,7 @@ static void motor_frame(const uint8_t *r, uint8_t n)
     } else if(r[1]==0x36 || r[1]==0x3A || r[1]==0x39 || r[1]==0x24 || r[1]==0x1F)
         accept_feedback(i,r);
     if(kind==BUS_CONTROL && request.kind==4 && r[1]==EMM_CMD_S_VER) {
-        request.kind=0;
-        reply_fw(i+1);
-        return;
+        request.kind=0; reply_fw(i+1); return;
     }
     if(kind==BUS_CONTROL && (request.kind==1 || request.kind==3)) request.step++;
     if(kind==BUS_STARTUP) startup_id++;
@@ -367,7 +337,7 @@ void tr_motor_byte(uint8_t b, uint32_t t)
     uint8_t n;
     now=t;
     if(startup_id<=MOTOR_COUNT && !bus.kind && tr_bus_idle() && due(bus_free_us)) {
-        uint8_t home[5]={(uint8_t)startup_id,0x9A,TR_STARTUP_ORIGIN_MODE,0,0x6B};
+        uint8_t home[5]={startup_id,0x9A,TR_STARTUP_ORIGIN_MODE,0,0x6B};
         if(tr_bus_write(home,5)) {
             bus.kind=BUS_STARTUP; bus.id=startup_id; bus.function=0x9A;
             bus.expected=4; bus.sent_us=now; bus.timeout_us=now+TR_REPLY_US;
@@ -424,27 +394,21 @@ static void host_frame(const uint8_t *r, uint8_t n)
             reply(TR_BUSY,0); return;
         }
         for(i=0;i<MOTOR_COUNT;i++) reset_cached_origin(&tr_motor[i]);
-        request.kind=3;
-        request.mask=(uint8_t)((1U<<MOTOR_COUNT)-1U);
-        request.id=0;
-        request.step=0;
-        request.since=now;
-        return;
+        request.kind=3; request.mask=(uint8_t)((1U<<MOTOR_COUNT)-1U);
+        request.id=0; request.step=0; request.since=now; return;
     }
     if(n==7 && r[3]==1 && r[4]>=1 && r[4]<=MOTOR_COUNT && r[5]==EMM_CMD_S_VER) {
         if(request.kind || bus.kind || !tr_bus_idle() || !due(bus_free_us)) {
             reply(TR_BUSY,0); return;
         }
         request.kind=4; request.mask=(uint8_t)(1U<<(r[4]-1));
-        request.id=(uint8_t)(r[4]-1); request.step=0; request.since=now;
-        return;
+        request.id=(uint8_t)(r[4]-1); request.step=0; request.since=now; return;
     }
     memset(segments,0,sizeof(segments));
     for(i=0;i<r[3];i++) {
         if(pos+2U>n-1U) { error=TR_FRAME; break; }
         id=r[pos++]; type=r[pos++];
-        if((id<1 && !(r[3]==1 && r[4]==0 && r[5]==0)) ||
-           id>MOTOR_COUNT || (id && (mask&(1U<<(id-1)))) || type>3) { error=TR_FRAME; break; }
+        if(id<1 || id>MOTOR_COUNT || (mask&(1U<<(id-1))) || type>3) { error=TR_FRAME; break; }
         ids[i]=id-1; mask|=(uint8_t)(1U<<(id-1));
         len=type==0 ? 0 : (type==1 ? 1 : 11);
         if(pos+len>n-1U) { error=TR_FRAME; break; }
@@ -473,12 +437,8 @@ static void host_frame(const uint8_t *r, uint8_t n)
         reply(global_fault,category==0 ? ids[0]+1 : 0); return;
     }
     if(category==0) {
-        /* A status request must obtain new physical position and flags after
-         * this request was received. Environment data may be reused only
-         * inside its bounded freshness window. */
         request.kind=2; request.id=ids[0]; request.since=now;
-        tr_motor[ids[0]].commands++;
-        return;
+        tr_motor[ids[0]].commands++; return;
     }
     if(category==1) {
         uint8_t cancel=(uint8_t)(mask & (uint8_t)~enables), previous, j;
@@ -565,33 +525,23 @@ static void control_service(void)
     m=&tr_motor[i]; en=(request.enables>>i)&1U;
     if(request.kind==3) {
         if(request.step==0) {
-            uint8_t reset[4]={(uint8_t)(i+1),0x0A,0x6D,0x6B};
-            send_bus(BUS_CONTROL,i+1,0x0A,4,0,reset,4);
-            return;
+            uint8_t reset[4]={pid(i),0x0A,0x6D,0x6B};
+            send_bus(BUS_CONTROL,pid(i),0x0A,4,0,reset,4); return;
         }
-        if(request.step==1) { read_bus(BUS_CONTROL,i+1,0x36); return; }
-        if(request.step==2) { read_bus(BUS_CONTROL,i+1,0x3A); return; }
+        if(request.step==1) { read_bus(BUS_CONTROL,pid(i),0x36); return; }
+        if(request.step==2) { read_bus(BUS_CONTROL,pid(i),0x3A); return; }
         if((m->valid&3U)!=3U || abs64((int64_t)m->position)>TR_STATIONARY_COUNTS) {
-            request.kind=0;
-            reply(TR_MOTOR,0);
-            return;
+            request.kind=0; reply(TR_MOTOR,0); return;
         }
-        m->start_position=m->position;
-        m->last_sent=m->position;
-        m->stationary_position=m->position;
-        m->stable_us=now;
-        request.id++;
-        request.step=0;
-        return;
+        m->start_position=m->position; m->last_sent=m->position;
+        m->stationary_position=m->position; m->stable_us=now;
+        request.id++; request.step=0; return;
     }
-    if(request.kind==4) {
-        read_bus(BUS_CONTROL,i+1,EMM_CMD_S_VER);
-        return;
-    }
+    if(request.kind==4) { read_bus(BUS_CONTROL,pid(i),EMM_CMD_S_VER); return; }
     if(request.stops&(1U<<i)) {
         if(request.step==0) {
-            uint8_t stop[5]={0,0xFE,0x98,0,0x6B}; stop[0]=i+1;
-            send_bus(BUS_CONTROL,i+1,0xFE,4,0,stop,5); return;
+            uint8_t stop[5]={pid(i),0xFE,0x98,0,0x6B};
+            send_bus(BUS_CONTROL,pid(i),0xFE,4,0,stop,5); return;
         }
         request.stops&=(uint8_t)~(1U<<i);
         request.id++; request.step=0; return;
@@ -599,48 +549,37 @@ static void control_service(void)
     if(en) {
         switch(request.step) {
         case 0:
-            /* Do not claim compatibility until the real 0x42 configuration
-             * response verifies UART, 115200, fixed 6B, 16 microsteps, ID and
-             * an ACK-producing response mode. */
             m->configured=0;
-            read_bus(BUS_CONTROL,i+1,0x42);
-            return;
+            read_bus(BUS_CONTROL,pid(i),0x42); return;
         case 1: {
-            /* Emm S_Vel_IS must be disabled so a legacy speed of N RPM means
-             * N RPM, not N/10. svF=0 avoids persistent configuration writes. */
-            uint8_t scale[6]={(uint8_t)(i+1),0x4F,0x71,0,0,0x6B};
-            send_bus(BUS_CONTROL,i+1,0x4F,4,0,scale,sizeof(scale));
-            return;
+            uint8_t scale[6]={pid(i),0x4F,0x71,0,0,0x6B};
+            send_bus(BUS_CONTROL,pid(i),0x4F,4,0,scale,sizeof(scale)); return;
         }
         case 2:
-            c[0]=i+1; c[1]=0xF3; c[2]=0xAB; c[3]=1;
-            send_bus(BUS_CONTROL,i+1,0xF3,4,1,c,6); return;
-        case 3: read_bus(BUS_CONTROL,i+1,0x36); return;
-        case 4: read_bus(BUS_CONTROL,i+1,0x3A); return;
+            c[0]=pid(i); c[1]=0xF3; c[2]=0xAB; c[3]=1;
+            send_bus(BUS_CONTROL,pid(i),0xF3,4,1,c,6); return;
+        case 3: read_bus(BUS_CONTROL,pid(i),0x36); return;
+        case 4: read_bus(BUS_CONTROL,pid(i),0x3A); return;
         case 5:
-            if(!m->no_temperature) { read_bus(BUS_CONTROL,i+1,0x39); return; }
-            request.step++;
-            return;
-        case 6: read_bus(BUS_CONTROL,i+1,0x24); return;
+            if(!m->no_temperature) { read_bus(BUS_CONTROL,pid(i),0x39); return; }
+            request.step++; return;
+        case 6: read_bus(BUS_CONTROL,pid(i),0x24); return;
         default:
             if(!m->configured || !(m->flags&1U) || !status_ready(m)) {
                 request.kind=0; reply(TR_CONFIG,0); return;
             }
             m->fault=0; m->last_sent=m->position;
-            request.id++; request.step=0;
-            return;
+            request.id++; request.step=0; return;
         }
     } else {
         switch(request.step) {
         case 0:
-            c[0]=i+1; c[1]=0xF3; c[2]=0xAB; c[3]=0;
-            send_bus(BUS_CONTROL,i+1,0xF3,4,0,c,6); return;
-        case 1:
-            read_bus(BUS_CONTROL,i+1,0x3A); return;
+            c[0]=pid(i); c[1]=0xF3; c[2]=0xAB; c[3]=0;
+            send_bus(BUS_CONTROL,pid(i),0xF3,4,0,c,6); return;
+        case 1: read_bus(BUS_CONTROL,pid(i),0x3A); return;
         default:
             if(m->flags&1U) { request.kind=0; reply(TR_MOTOR,0); return; }
-            request.id++; request.step=0;
-            return;
+            request.id++; request.step=0; return;
         }
     }
 }
@@ -771,27 +710,23 @@ static bool stream_tick(void)
             }
         }
         pulses=tr_counts_to_pulses(i,wire_target);
-        packet[n++]=i+1; packet[n++]=0xFD;
+        packet[n++]=pid(i); packet[n++]=0xFD;
         packet[n++]=pulses<0 ? 1 : 0;
         put_be16(packet+n,rpm); n+=2;
         packet[n++]=0;
         put_be32(packet+n,(uint32_t)abs64(pulses)); n+=4;
-        packet[n++]=1;
-        packet[n++]=0;
-        packet[n++]=0x6B;
+        packet[n++]=1; packet[n++]=0; packet[n++]=0x6B;
         m->last_sent=target; m->last_sample_us=sample;
     }
     if(n==4) return true;
     if(n==17) {
         if(!send_bus(BUS_STREAM,packet[4],0xFD,4,0,packet+4,13)) return false;
-        tr_diag.stream_packets++;
-        return true;
+        tr_diag.stream_packets++; return true;
     }
-    /* X42S multi-motor format is 00 AA + 16-bit total subcommand-byte length
-     * + complete commands + final 6B. It is not RS485-specific and remains a
-     * TTL UART frame. Only address 1 may acknowledge the batch; physical
-     * completion is therefore always determined from subsequent 0x36/0x3A. */
-    packet[n++]=0x6B; put_be16(packet+2,(uint16_t)(n-5U));
+    packet[n++]=0x6B;
+    /* X42S manual example 00 AA 00 22 ... is 34 bytes total, so this length
+     * field is the complete frame length, not only the nested commands. */
+    put_be16(packet+2,n);
     if(!send_bus(BUS_STREAM,1,0xFD,4,0,packet,n)) return false;
     tr_diag.stream_packets++;
     return true;
@@ -810,14 +745,10 @@ static void check_motion(void)
                 (int32_t)(m->flags_us-m->finish_us)>0;
         reached=(m->flags&2U) && abs64((int64_t)m->position-s->target)<=TR_REACH_COUNTS;
         if(!s->home && (m->flags&4U)) { fail(TR_STALL); return; }
-        if(s->home && (m->flags&4U)) {
-            m->active=2;
-            continue;
-        }
+        if(s->home && (m->flags&4U)) { m->active=2; continue; }
         clamp=MOTOR_IS_FINGER(i+1) && s->current<=TR_CLAMP_MAX_PERCENT && !s->home;
         if(s->home && stationary && abs64((int64_t)m->position-s->target)>TR_REACH_COUNTS) {
-            m->active=2;
-            continue;
+            m->active=2; continue;
         }
         if(!settled || s->end_rpm) continue;
         if(reached || (clamp && stationary)) {
@@ -825,9 +756,6 @@ static void check_motion(void)
             m->active=0; m->carry_rpm=0;
             m->head=(uint8_t)((m->head+1)%TR_QUEUE_SIZE); m->count--;
         } else if(now-m->finish_us>TR_SETTLE_US) {
-            /* Never fabricate completion. A normal segment that has not
-             * physically reached the final target after the settle window is
-             * a failed/stalled translation, not a successful legacy trap. */
             fail(TR_STALL); return;
         }
     }
@@ -851,26 +779,21 @@ static void feedback_service(void)
     }
     if(request.kind==2) {
         m=&tr_motor[request.id];
-        if(status_ready(m) &&
-           (int32_t)(m->pos_us-request.since)>=0 &&
+        if(status_ready(m) && (int32_t)(m->pos_us-request.since)>=0 &&
            (int32_t)(m->flags_us-request.since)>=0) {
             uint8_t id=request.id; request.kind=0; reply(TR_OK,id+1); return;
         }
         if(spare_time(3600)) {
-            /* For every legacy STAT, position and flags must be newly read
-             * after the host request. Temperature/voltage may be reused only
-             * within their explicit freshness interval. */
             if(!(m->valid&1) || (int32_t)(m->pos_us-request.since)<0) field=0;
             else if(!(m->valid&2) || (int32_t)(m->flags_us-request.since)<0) field=1;
             else if(!m->no_temperature && (!(m->valid&4) || now-m->temp_us>TR_ENVIRONMENT_US)) field=2;
             else if(!(m->valid&8) || now-m->voltage_us>TR_ENVIRONMENT_US) field=3;
             else field=0;
-            read_bus(BUS_FEEDBACK,request.id+1,functions[field]);
-            return;
+            read_bus(BUS_FEEDBACK,pid(request.id),functions[field]); return;
         }
     }
     if(!spare_time(3600)) return;
-    if(oldest_id) { read_bus(BUS_FEEDBACK,oldest_id,functions[oldest_field]); return; }
+    if(oldest_id) { read_bus(BUS_FEEDBACK,pid(oldest_id-1),functions[oldest_field]); return; }
     for(i=0;i<MOTOR_COUNT;i++) {
         uint8_t id=(poll_motor+i)%MOTOR_COUNT;
         m=&tr_motor[id];
@@ -880,7 +803,7 @@ static void feedback_service(void)
             if(!m->no_temperature && (!(m->valid&4) || now-m->temp_us>TR_ENVIRONMENT_US/2)) field=2;
             else if(!(m->valid&8) || now-m->voltage_us>TR_ENVIRONMENT_US/2) field=3;
         }
-        if(read_bus(BUS_FEEDBACK,id+1,functions[field])) {
+        if(read_bus(BUS_FEEDBACK,pid(id),functions[field])) {
             poll_field^=1;
             if(poll_field==0) poll_motor=(uint8_t)((id+1)%MOTOR_COUNT);
         }
@@ -903,46 +826,33 @@ void tr_poll(uint32_t t)
         if(bus.kind==BUS_STARTUP) {
             startup_id++; bus.kind=0; bus_free_us=now+TR_BUS_GAP_US;
         } else if(bus.kind==BUS_FEEDBACK) {
-            uint8_t id=bus.id;
+            uint8_t logical=logical_from_pid(bus.id);
             tr_diag.timeouts++;
-            if(id>=1 && id<=MOTOR_COUNT) tr_motor[id-1].valid=0;
+            if(logical<MOTOR_COUNT) tr_motor[logical].valid=0;
             bus.kind=0; bus_free_us=now+TR_BUS_GAP_US;
-            if(request.kind==2 && request.id+1==id) {
-                request.kind=0; reply(TR_TIMEOUT,id);
+            if(request.kind==2 && logical==request.id) {
+                request.kind=0; reply(TR_TIMEOUT,request.id+1);
             }
-        } else if(request.kind==3 && bus.kind==BUS_CONTROL) {
-            uint8_t fn=bus.function;
-            bus.kind=0; bus_free_us=now+TR_BUS_GAP_US;
-            tr_diag.timeouts++;
-            /* Some firmware revisions may omit the reset ACK. That omission
-             * is never treated as reset success: we advance only to mandatory
-             * 0x36/0x3A verification. */
-            if(fn==0x0A && request.step==0) request.step=1;
-            else { request.kind=0; reply(TR_TIMEOUT,0); }
         } else if(request.kind==4) {
             bus.kind=0; bus_free_us=now+TR_BUS_GAP_US;
-            tr_diag.timeouts++;
-            request.kind=0;
-            reply(TR_TIMEOUT,0);
+            tr_diag.timeouts++; request.kind=0; reply(TR_TIMEOUT,0);
         } else if(bus.kind==BUS_STREAM) {
-            /* X42S 0xAA batches do not provide one ACK per contained motor.
-             * Do not fabricate an ACK; clear the transaction slot and let
-             * mandatory 0x36/0x3A telemetry decide physical completion. */
             bus.kind=0; bus_free_us=now+TR_BUS_GAP_US;
             tr_diag.timeouts++;
         } else {
-            bus.kind=0; bus_free_us=now+TR_BUS_GAP_US; tr_diag.timeouts++; fail(TR_TIMEOUT);
+            /* Configuration, enable, current, stop and reset all have a
+             * documented 4-byte ACK. Missing ACK is an error, never success. */
+            bus.kind=0; bus_free_us=now+TR_BUS_GAP_US;
+            tr_diag.timeouts++; fail(TR_TIMEOUT);
         }
     }
     if(request.kind==2 && now-request.since>100000UL) {
         uint8_t id=request.id;
-        request.kind=0;
-        /* Previous code returned TR_OK here without motor data. Never do that. */
-        reply(TR_TIMEOUT,id+1);
+        request.kind=0; reply(TR_TIMEOUT,id+1);
     } else if(request.kind && now-request.since>900000UL) {
         uint8_t kind=request.kind;
         request.kind=0;
-        if(kind==3 || kind==1 || kind==4) reply(TR_TIMEOUT,0);
+        if(kind==1 || kind==3 || kind==4) reply(TR_TIMEOUT,0);
         else fail(TR_TIMEOUT);
     }
     if(global_fault) {
@@ -961,21 +871,19 @@ void tr_poll(uint32_t t)
         late=now-next_tick;
         if(moving() && late>TR_LATE_US) { fail(TR_DEADLINE); return; }
         if(moving() && late>tr_diag.max_tick_late_us) tr_diag.max_tick_late_us=late;
-        if(moving() && coast_tick()) {
-            next_tick+=TR_TICK_US;
-        } else if(!bus.kind && tr_bus_idle() && due(bus_free_us)) {
+        if(moving() && coast_tick()) next_tick+=TR_TICK_US;
+        else if(!bus.kind && tr_bus_idle() && due(bus_free_us)) {
             if(!moving()) next_tick=now;
             if(stream_tick()) next_tick=moving() ? next_tick+TR_TICK_US : now+TR_TICK_US;
         }
     }
     if(bus.kind || !tr_bus_idle() || !due(bus_free_us) || global_fault) return;
     for(i=0;i<MOTOR_COUNT;i++) if(tr_motor[i].active==2 && spare_time(3600)) {
-        uint8_t c[5]={0,0xFE,0x98,0,0x6B}; c[0]=i+1;
-        send_bus(BUS_HOME_STOP,i+1,0xFE,4,0,c,5); return;
+        uint8_t c[5]={pid(i),0xFE,0x98,0,0x6B};
+        send_bus(BUS_HOME_STOP,pid(i),0xFE,4,0,c,5); return;
     }
     if((request.kind==1 || request.kind==3 || request.kind==4) && spare_time(6500)) {
-        control_service();
-        return;
+        control_service(); return;
     }
     for(i=0;i<MOTOR_COUNT;i++) {
         TrMotor *m=&tr_motor[i];
