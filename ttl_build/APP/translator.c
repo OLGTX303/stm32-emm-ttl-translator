@@ -359,6 +359,7 @@ static void host_frame(const uint8_t *r, uint8_t n)
          * four EMM encoder origins with 0x0A/0x6D. */
         /* A stale explicit status request must not block this recovery
          * operation after a disconnected/reconnected motor bus. */
+        uint8_t clear_fault[4]={0,0x0E,0x52,0x6B};
         uint8_t reset[4]={0,0x0A,0x6D,0x6B};
         if(request.kind==2) request.kind=0;
         if(request.kind || bus.kind || !tr_bus_idle() || !due(bus_free_us)) {
@@ -366,7 +367,7 @@ static void host_frame(const uint8_t *r, uint8_t n)
         }
         /* Address zero is the EMM broadcast address. This command is
          * write-only and has no acknowledgement on several EMM revisions. */
-        if(!tr_bus_write(reset,4)) { reply(TR_UART,0); return; }
+        if(!tr_bus_write(clear_fault,4) || !tr_bus_write(reset,4)) { reply(TR_UART,0); return; }
         bus_free_us=now+TR_BUS_GAP_US;
         reply(TR_OK,0);
         return;
