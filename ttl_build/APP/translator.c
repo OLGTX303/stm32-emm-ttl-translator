@@ -896,6 +896,14 @@ void tr_poll(uint32_t t)
             bus.kind=0; bus_free_us=now+TR_BUS_GAP_US;
             tr_diag.timeouts++;
             if(request.id>=MOTOR_COUNT) { request.kind=0; reply(TR_OK,0); }
+        } else if(request.kind==4) {
+            /* Firmware identification is optional.  A missing 0x1F reply
+             * must release only this query; do not latch a global motor
+             * fault or strand later host commands behind BUSY. */
+            bus.kind=0; bus_free_us=now+TR_BUS_GAP_US;
+            tr_diag.timeouts++;
+            request.kind=0;
+            reply(TR_TIMEOUT,0);
         } else if(bus.kind==BUS_STREAM) {
             /* AA synchronized motion acknowledgements are optional on EMM
              * firmware. The complete two-axis batch is already on the bus;
