@@ -18,7 +18,7 @@ static struct {
     uint32_t sent_us, timeout_us;
 } bus;
 static struct {
-    uint8_t kind, mask, enables, stops, id, step; /* kind: 0 none, 1 enable, 2 status, 3 reset-zero */
+    uint8_t kind, mask, enables, stops, id, step; /* kind: 0 none, 1 enable, 2 status, 3 reset-zero, 4 firmware */
     uint32_t since;
 } request;
 
@@ -123,6 +123,17 @@ static void reply(uint8_t error, uint8_t stat_id)
     }
     r[2]=n; r[n-1]=tr_crc8(r,n-1);
     if(!tr_host_write(r,n)) tr_uart_fault();
+}
+static void reply_fw(uint8_t motor_id)
+{
+    TrMotor *m=&tr_motor[motor_id-1];
+    /* Host firmware response: FF FF 09 id fw_hi fw_lo hw_series/type hw_ver crc. */
+    uint8_t r[9]={0xFF,0xFF,9,motor_id,0,0,0,0,0};
+    put_be16(r+4,m->fw_version);
+    r[6]=(uint8_t)((m->hw_series<<4)|(m->hw_type&0x0F));
+    r[7]=m->hw_version;
+    r[8]=tr_crc8(r,8);
+    if(!tr_host_write(r,sizeof(r))) tr_uart_fault();
 }
 static void cancel_motor(TrMotor *m)
 {
@@ -288,8 +299,13 @@ static void motor_frame(const uint8_t *r, uint8_t n)
     else if(r[1]==0xF3) {
         tr_motor[i].enabled=value;
         if(!value) { cancel_motor(&tr_motor[i]); tr_motor[i].fault=0; }
-    } else if(r[1]==0x36 || r[1]==0x3A || r[1]==0x39 || r[1]==0x24)
+    } else if(r[1]==0x36 || r[1]==0x3A || r[1]==0x39 || r[1]==0x24 || r[1]==0x1F)
         accept_feedback(i,r);
+    if(kind==BUS_CONTROL && request.kind==4 && r[1]==0x1F) {
+        request.kind=0;
+        reply_fw(i+1);
+        return;
+    }
     if(kind==BUS_CONTROL && (request.kind==1 || request.kind==3)) request.step++;
     if(kind==BUS_STARTUP) { startup_id++; }
     if(kind==BUS_HOME_STOP) {
@@ -369,6 +385,15 @@ static void host_frame(const uint8_t *r, uint8_t n)
         }
         reset_mask=(uint8_t)((1U<<MOTOR_COUNT)-1U);
         reply(TR_OK,0);
+        return;
+    }
+    if(n==7 && r[3]==1 && r[4]>=1 && r[4]<=MOTOR_COUNT && r[5]==0x1F) {
+        /* Maintenance query: read the EMM firmware/hardware identification. */
+        if(request.kind || bus.kind || !tr_bus_idle() || !due(bus_free_us)) {
+            reply(TR_BUSY,0); return;
+        }
+        request.kind=4; request.mask=(uint8_t)(1U<<(r[4]-1));
+        request.id=(uint8_t)(r[4]-1); request.step=0; request.since=now;
         return;
     }
     memset(segments,0,sizeof(segments));
@@ -508,6 +533,10 @@ static void control_service(void)
         uint8_t reset[4]={(uint8_t)(i+1),0x0A,0x6D,0x6B};
         send_bus(BUS_CONTROL,i+1,0x0A,4,0,reset,4);
         request.id++;
+        return;
+    }
+    if(request.kind==4) {
+        read_bus(BUS_CONTROL,i+1,0x1F);
         return;
     }
     if(request.stops&(1U<<i)) {
@@ -924,7 +953,7 @@ void tr_poll(uint32_t t)
         uint8_t c[5]={0,0xFE,0x98,0,0x6B}; c[0]=i+1;
         send_bus(BUS_HOME_STOP,i+1,0xFE,4,0,c,5); return;
     }
-    if(request.kind==1 && spare_time(6500)) { control_service(); return; }
+    if((request.kind==1 || request.kind==4) && spare_time(6500)) { control_service(); return; }
     for(i=0;i<MOTOR_COUNT;i++) {
         TrMotor *m=&tr_motor[i];
         if(!m->active && m->count && group_at_heads(front(m)) &&

@@ -150,6 +150,32 @@ def receive_response(ser, expected_length=15, timeout=1):
         time.sleep(0.001)
     return None
 
+def receive_frame(ser, timeout=1):
+    """Receive one translator frame, honoring its length byte."""
+    start_time = time.time()
+    buffer = bytearray()
+    while time.time() - start_time < timeout:
+        if ser.in_waiting:
+            buffer += ser.read(ser.in_waiting)
+        while len(buffer) >= 3:
+            pos = buffer.find(b'\xff\xff')
+            if pos < 0:
+                buffer = buffer[-1:]
+                break
+            if pos:
+                del buffer[:pos]
+            length = buffer[2]
+            if length < 5 or length > 128:
+                del buffer[0]
+                continue
+            if len(buffer) < length:
+                break
+            frame = bytes(buffer[:length])
+            del buffer[:length]
+            return frame
+        time.sleep(0.001)
+    return None
+
 def parse_stat_response(frame):
     """解析查询指令的响应数据"""
     if len(frame) != 15:
@@ -237,6 +263,32 @@ def cmd_reset_zero(ser):
     frame = build_command_frame(1, [0], [0], [bytes()])
     ser.write(frame)
     return parse_other_response(receive_response(ser, 5))
+
+def cmd_read_fw(ser, id):
+    """Read EMM firmware and hardware identification through the translator."""
+    if not 1 <= id <= 4:
+        raise ValueError("motor id must be 1..4")
+    # Private translator query: one motor, function 0x1F (EMM version read).
+    frame = build_command_frame(1, [id], [0x1F], [bytes()])
+    ser.write(frame)
+    response = receive_frame(ser)
+    if response is None:
+        raise TimeoutError("firmware response timeout")
+    if len(response) == 5:
+        return parse_other_response(response)
+    if len(response) != 9:
+        raise ValueError("invalid firmware response length")
+    if response[2] != 9 or crc8(response[:8]) != response[8]:
+        raise ValueError("invalid firmware response CRC/frame")
+    if response[3] != id:
+        raise ValueError("firmware response motor id mismatch")
+    return {
+        "motor_id": response[3],
+        "fw_version": (response[4] << 8) | response[5],
+        "hw_series": response[6] >> 4,
+        "hw_type": response[6] & 0x0F,
+        "hw_version": response[7],
+    }
 
 def cmd_wait_motion(ser, id):
     logger.debug("等待%d号控制板完成运动控制", id)
