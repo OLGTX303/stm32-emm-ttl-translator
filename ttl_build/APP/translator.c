@@ -700,6 +700,11 @@ static void check_motion(void)
         stationary=now-m->stable_us>=TR_STATIONARY_US && now-m->start_us>=TR_HOME_MIN_US;
         settled=due(m->finish_us) && (int32_t)(m->pos_us-m->finish_us)>0 &&
                 (int32_t)(m->flags_us-m->finish_us)>0;
+        if(s->home && (m->flags&4U)) {
+            /* EMM stall/limit feedback is the homing stop signal. */
+            m->active=2;
+            continue;
+        }
         clamp=MOTOR_IS_FINGER(i+1) && s->current<=TR_CLAMP_MAX_PERCENT && !s->home;
         if(s->home && stationary && abs64((int64_t)m->position-s->target)>TR_REACH_COUNTS) {
             m->active=2; /* Stop is acknowledged before reporting home complete. */
