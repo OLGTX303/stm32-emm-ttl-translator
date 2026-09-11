@@ -25,6 +25,10 @@ typedef struct {
     uint16_t voltage, commands;
     uint16_t fw_version;
     uint8_t hw_series, hw_type, hw_version;
+    /* Exact 28-byte Rev1.3 configuration payload returned by 0x42/0x6C.
+     * It is cached so the bridge can change only Ma_Limit with 0x48/0xD1
+     * while preserving every other driver setting. */
+    uint8_t config_raw[28];
     int32_t position, start_position, last_sent, stationary_position;
     uint32_t pos_us, flags_us, temp_us, voltage_us, start_us, stable_us;
     uint32_t finish_us, last_sample_us, cruise_until_us;
