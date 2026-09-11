@@ -363,15 +363,21 @@ static void host_frame(const uint8_t *r, uint8_t n)
          * four EMM encoder origins with 0x0A/0x6D. */
         /* A stale explicit status request must not block this recovery
          * operation after a disconnected/reconnected motor bus. */
-        uint8_t clear_fault[4]={0,0x0E,0x52,0x6B};
-        uint8_t reset[4]={0,0x0A,0x6D,0x6B};
+        uint8_t clear_fault[16], reset[16];
+        uint8_t j;
         if(request.kind==2) request.kind=0;
         if(request.kind || bus.kind || !tr_bus_idle() || !due(bus_free_us)) {
             reply(TR_BUSY,0); return;
         }
-        /* Address zero is the EMM broadcast address. This command is
-         * write-only and has no acknowledgement on several EMM revisions. */
-        if(!tr_bus_write(clear_fault,4) || !tr_bus_write(reset,4)) { reply(TR_UART,0); return; }
+        /* Some fitted EMM revisions ignore address zero. Send explicit
+         * write-only frames to all four addresses, without waiting for ACKs. */
+        for(j=0;j<MOTOR_COUNT;j++) {
+            clear_fault[4*j]=(uint8_t)(j+1); clear_fault[4*j+1]=0x0E;
+            clear_fault[4*j+2]=0x52; clear_fault[4*j+3]=0x6B;
+            reset[4*j]=(uint8_t)(j+1); reset[4*j+1]=0x0A;
+            reset[4*j+2]=0x6D; reset[4*j+3]=0x6B;
+        }
+        if(!tr_bus_write(clear_fault,16) || !tr_bus_write(reset,16)) { reply(TR_UART,0); return; }
         bus_free_us=now+TR_BUS_GAP_US;
         reply(TR_OK,0);
         return;
