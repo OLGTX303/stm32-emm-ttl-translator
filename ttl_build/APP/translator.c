@@ -176,9 +176,10 @@ static bool read_bus(uint8_t kind, uint8_t id, uint8_t fn)
 static bool set_current(uint8_t kind, uint8_t i, uint8_t percent)
 {
     uint8_t c[7]={0,0x45,0x66,0,0,0,0x6B};
-    /* Arm motors drive the geared mechanism and cannot twist reliably at the
-     * finger clamp current used by the legacy host sequence. */
-    if(!MOTOR_IS_FINGER(i+1)) percent=100;
+    /* The coupled twist moves a finger and geared arm together. Use full
+     * drive current for every motion segment so the finger does not lose
+     * torque at the legacy 40%% clamp setting. */
+    percent=100;
     c[0]=i+1; put_be16(c+4,(uint16_t)(TR_FULL_CURRENT_MA*percent/100U));
     return send_bus(kind,i+1,0x45,4,percent,c,sizeof(c));
 }
