@@ -13,6 +13,8 @@ static uint8_t host_rx[128], motor_rx[64];
 static uint16_t host_used, motor_used;
 static uint32_t host_byte_us, motor_byte_us;
 enum { BUS_NONE, BUS_CONTROL, BUS_CURRENT, BUS_FEEDBACK, BUS_STREAM, BUS_HOME_STOP, BUS_STARTUP };
+/* Emm_V5.h: S_VER=0 maps to the wire command 0x1F. */
+enum { EMM_S_VER=0, EMM_CMD_S_VER=0x1F };
 static struct {
     uint8_t kind, id, function, expected, value;
     uint32_t sent_us, timeout_us;
@@ -180,7 +182,7 @@ static bool read_bus(uint8_t kind, uint8_t id, uint8_t fn)
     c[0]=id; c[1]=fn;
     if(fn==0x36) expected=8;
     if(fn==0x39 || fn==0x24) expected=5;
-    if(fn==0x1F) expected=7;
+    if(fn==EMM_CMD_S_VER) expected=7;
     if(fn==0x42) { c[2]=0x6C; n=4; expected=0; }
     return send_bus(kind,id,fn,expected,0,c,n);
 }
@@ -227,7 +229,7 @@ static void accept_feedback(uint8_t i, const uint8_t *r)
         /* Host wire field is signed int16 mV: do not wrap >32.767 V. */
         if(m->voltage>32767 || m->voltage<10000) { fail(TR_RANGE); return; }
         m->voltage_us=now; m->valid|=8;
-    } else if(r[1]==0x1F) {
+    } else if(r[1]==EMM_CMD_S_VER) {
         m->fw_version=be16(r+2);
         m->hw_series=(uint8_t)(r[4]>>4);
         m->hw_type=(uint8_t)(r[4]&0x0F);
@@ -301,7 +303,7 @@ static void motor_frame(const uint8_t *r, uint8_t n)
         if(!value) { cancel_motor(&tr_motor[i]); tr_motor[i].fault=0; }
     } else if(r[1]==0x36 || r[1]==0x3A || r[1]==0x39 || r[1]==0x24 || r[1]==0x1F)
         accept_feedback(i,r);
-    if(kind==BUS_CONTROL && request.kind==4 && r[1]==0x1F) {
+    if(kind==BUS_CONTROL && request.kind==4 && r[1]==EMM_CMD_S_VER) {
         request.kind=0;
         reply_fw(i+1);
         return;
@@ -338,7 +340,7 @@ void tr_motor_byte(uint8_t b, uint32_t t)
             switch(motor_rx[1]) {
             case 0x36: n=8; break;
             case 0x39: case 0x24: n=5; break;
-            case 0x1F: n=7; break;
+            case EMM_CMD_S_VER: n=7; break;
             case 0x42:
                 if(motor_used<3) return;
                 /* Length byte counts the configuration payload; include
@@ -387,7 +389,7 @@ static void host_frame(const uint8_t *r, uint8_t n)
         reply(TR_OK,0);
         return;
     }
-    if(n==7 && r[3]==1 && r[4]>=1 && r[4]<=MOTOR_COUNT && r[5]==0x1F) {
+    if(n==7 && r[3]==1 && r[4]>=1 && r[4]<=MOTOR_COUNT && r[5]==EMM_CMD_S_VER) {
         /* Maintenance query: read the EMM firmware/hardware identification. */
         if(request.kind || bus.kind || !tr_bus_idle() || !due(bus_free_us)) {
             reply(TR_BUSY,0); return;
@@ -536,7 +538,7 @@ static void control_service(void)
         return;
     }
     if(request.kind==4) {
-        read_bus(BUS_CONTROL,i+1,0x1F);
+        read_bus(BUS_CONTROL,i+1,EMM_CMD_S_VER);
         return;
     }
     if(request.stops&(1U<<i)) {

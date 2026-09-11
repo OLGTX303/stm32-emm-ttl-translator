@@ -6,6 +6,10 @@ import argparse
 import time
 import serial
 
+# Emm_V5.h: S_VER is the system-parameter selector; Emm_V5.c maps it to 0x1F.
+S_VER = 0
+EMM_SYS_PARAM_COMMAND = {S_VER: 0x1F}
+
 
 def crc8(data):
     crc = 0
@@ -49,7 +53,7 @@ def main():
     args = parser.parse_args()
     if not 1 <= args.motor <= 4:
         parser.error("motor must be 1..4")
-    frame = bytearray((0xFF, 0xFF, 7, 1, args.motor, 0x1F))
+    frame = bytearray((0xFF, 0xFF, 7, 1, args.motor, EMM_SYS_PARAM_COMMAND[S_VER]))
     frame.append(crc8(frame))
     with serial.Serial(args.port, 115200, timeout=0.05, write_timeout=1) as port:
         port.reset_input_buffer()
