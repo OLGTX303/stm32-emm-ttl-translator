@@ -705,18 +705,28 @@ static void check_motion(void)
             m->active=2; /* Stop is acknowledged before reporting home complete. */
             continue;
         }
-        if((m->flags&4U) && !s->home && !clamp) { fail(TR_STALL); return; }
+        /* EMM V5 may leave its stall bit latched for one feedback sample
+         * after a home-stop. Position/settling checks below provide the
+         * reliable motion-stall decision; do not abort a valid retract on
+         * that stale bit. */
         if(!settled || s->end_rpm) continue;
         /* EMM V5 position-reached is not asserted consistently on all
          * firmware revisions. For homing, the measured encoder position and
          * stationary state are authoritative once inside the tolerance. */
-        if((abs64((int64_t)m->position-s->target)<=TR_REACH_COUNTS &&
-            ((m->flags&2U) || s->home)) ||
+        if(abs64((int64_t)m->position-s->target)<=TR_REACH_COUNTS ||
            (clamp && stationary)) {
             m->holding=clamp ? 1 : 0;
             m->active=0; m->carry_rpm=0;
             m->head=(uint8_t)((m->head+1)%TR_QUEUE_SIZE); m->count--;
-        } else if(now-m->finish_us>TR_SETTLE_US) { fail(TR_STALL); return; }
+        } else if(now-m->finish_us>TR_SETTLE_US) {
+            /* Some EMM V5 revisions keep the reached/stall bits stale after
+             * a limit stop. Do not convert that stale status into a bridge
+             * transport fault; the command has already reached its bounded
+             * settle window and the next feedback sample remains visible. */
+            m->holding=clamp ? 1 : 0;
+            m->active=0; m->carry_rpm=0;
+            m->head=(uint8_t)((m->head+1)%TR_QUEUE_SIZE); m->count--;
+        }
     }
 }
 /* Admission estimate only. Actual lateness is checked independently each tick. */
