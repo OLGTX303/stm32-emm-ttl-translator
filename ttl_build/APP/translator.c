@@ -18,7 +18,7 @@ static struct {
     uint32_t sent_us, timeout_us;
 } bus;
 static struct {
-    uint8_t kind, mask, enables, stops, id, step; /* kind: 0 none, 1 enable, 2 status */
+    uint8_t kind, mask, enables, stops, id, step; /* kind: 0 none, 1 enable, 2 status, 3 reset-zero */
     uint32_t since;
 } request;
 
@@ -253,7 +253,7 @@ static void motor_frame(const uint8_t *r, uint8_t n)
         TrMotor *m=&tr_motor[bus.id-1];
         m->no_temperature=1; m->temperature=-128; m->valid|=4; m->temp_us=now;
         tr_diag.unsupported_temperature_mask|=(uint8_t)(1U<<(bus.id-1));
-        if(bus.kind==BUS_CONTROL && request.kind==1) request.step++;
+        if(bus.kind==BUS_CONTROL && (request.kind==1 || request.kind==3)) request.step++;
         bus.kind=0; bus_free_us=now+TR_BUS_GAP_US;
         return;
     }
@@ -286,7 +286,7 @@ static void motor_frame(const uint8_t *r, uint8_t n)
         if(!value) { cancel_motor(&tr_motor[i]); tr_motor[i].fault=0; }
     } else if(r[1]==0x36 || r[1]==0x3A || r[1]==0x39 || r[1]==0x24)
         accept_feedback(i,r);
-    if(kind==BUS_CONTROL && request.kind==1) request.step++;
+    if(kind==BUS_CONTROL && (request.kind==1 || request.kind==3)) request.step++;
     if(kind==BUS_STARTUP) { startup_id++; }
     if(kind==BUS_HOME_STOP) {
         TrMotor *m=&tr_motor[i];
@@ -327,7 +327,7 @@ void tr_motor_byte(uint8_t b, uint32_t t)
                   (uint8_t)(motor_rx[2]+6U) : motor_rx[2];
                 if(n<5 || n>sizeof(motor_rx)) n=0;
                 break;
-            case 0: case 0x3A: case 0x45: case 0x46: case 0x9A: case 0xF3:
+            case 0: case 0x0A: case 0x3A: case 0x45: case 0x46: case 0x9A: case 0xF3:
             case 0xFD: case 0xFE: case 0x0E: n=4; break;
             default: break;
             }
@@ -358,7 +358,8 @@ static void host_frame(const uint8_t *r, uint8_t n)
     for(i=0;i<r[3];i++) {
         if(pos+2U>n-1U) { error=TR_FRAME; break; }
         id=r[pos++]; type=r[pos++];
-        if(id<1 || id>MOTOR_COUNT || (mask&(1U<<(id-1))) || type>3) { error=TR_FRAME; break; }
+        if((id<1 && !(r[3]==1 && r[4]==0 && r[5]==0)) ||
+           id>MOTOR_COUNT || (id && (mask&(1U<<(id-1)))) || type>3) { error=TR_FRAME; break; }
         ids[i]=id-1; mask|=(uint8_t)(1U<<(id-1));
         len=type==0 ? 0 : (type==1 ? 1 : 11);
         if(pos+len>n-1U) { error=TR_FRAME; break; }
@@ -382,6 +383,16 @@ static void host_frame(const uint8_t *r, uint8_t n)
     }
     if(!error && pos!=n-1) error=TR_FRAME;
     if(error) { reply(error,0); return; }
+    /* Special maintenance command: FF FF 07 01 00 00 CRC.
+     * After the operator manually holds the mechanism at the horizon, send
+     * EMM V5 0x0A/0x6D to every motor and clear all four encoder origins. */
+    if(r[3]==1 && r[4]==0 && r[5]==0) {
+        if(request.kind) { reply(TR_BUSY,0); return; }
+        request.kind=3; request.mask=(uint8_t)((1U<<MOTOR_COUNT)-1U);
+        request.enables=0; request.stops=0; request.id=0; request.step=0;
+        request.since=now;
+        return;
+    }
     if(request.kind) { reply(TR_BUSY,category==0 ? ids[0]+1 : 0); return; }
     /* A disable is the per-motor recovery path after transport/motor faults;
      * do not require the host to know the faulted set or issue an all-axis
@@ -486,6 +497,12 @@ static void control_service(void)
     request.id=i;
     if(i==MOTOR_COUNT) { request.kind=0; reply(TR_OK,0); return; }
     m=&tr_motor[i]; en=(request.enables>>i)&1U;
+    if(request.kind==3) {
+        uint8_t reset[4]={(uint8_t)(i+1),0x0A,0x6D,0x6B};
+        send_bus(BUS_CONTROL,i+1,0x0A,4,0,reset,4);
+        request.id++;
+        return;
+    }
     if(request.stops&(1U<<i)) {
         if(request.step==0) {
             uint8_t stop[5]={0,0xFE,0x98,0,0x6B}; stop[0]=i+1;

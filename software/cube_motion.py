@@ -228,6 +228,16 @@ def cmd_stat(ser, id):
         logger.debug("未接收到响应")
         return None
 
+def cmd_reset_zero(ser):
+    """Set all EMM V5 encoder origins to zero after manual alignment.
+
+    Hold both fingers/arms at the desired horizon, then issue this command.
+    The translator sends EMM 0x0A/0x6D to motors 1..4 sequentially.
+    """
+    frame = build_command_frame(1, [0], [0], [bytes()])
+    ser.write(frame)
+    return parse_other_response(receive_response(ser, 5))
+
 def cmd_wait_motion(ser, id):
     logger.debug("等待%d号控制板完成运动控制", id)
     start_time = time.time()
