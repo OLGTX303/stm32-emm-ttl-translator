@@ -15,7 +15,10 @@
 #define TR_HOME_MIN_US 80000UL
 #define TR_STATIONARY_US 100000UL
 #define TR_STATIONARY_COUNTS 8L
-#define TR_REACH_COUNTS 512L
+/* 40 legacy counts = 0.879 deg at 16384 counts/rev, closely matching the
+ * Emm Rev1.3 default 0.8 deg position-reached window. The old 512-count
+ * threshold was 11.25 deg and could falsely report a cube move complete. */
+#define TR_REACH_COUNTS 40L
 #define TR_FULL_CURRENT_MA 2500U
 #define TR_MAX_RPM 3000U
 #define TR_CLAMP_MAX_PERCENT 40U
