@@ -71,6 +71,8 @@ static void reset_cached_origin(TrMotor *m)
     m->valid=0;
     m->pos_us=0;
     m->flags_us=0;
+    m->temp_us=0;
+    m->voltage_us=0;
     m->stable_us=now;
 }
 uint8_t tr_crc8(const uint8_t *p, uint16_t n)
@@ -88,7 +90,8 @@ uint8_t tr_crc8(const uint8_t *p, uint16_t n)
 int64_t tr_counts_to_pulses(uint8_t i, int32_t counts)
 {
     int64_t v=((int64_t)counts-offset[i])*direction[i]*MOTOR_PULSES_PER_REV;
-    /* Old controller: 16384 counts/rev. ZDT 0xFD: 200*microstep pulses/rev. */
+    /* Legacy controller: 16384 counts/rev. Emm FD at 16 microsteps: 3200
+     * command pulses/rev. Keep the full multi-turn absolute coordinate. */
     return v < 0 ? -((-v+8192)/16384) : (v+8192)/16384;
 }
 bool tr_profile(TrProfile *p, int64_t distance, float start_rpm,
@@ -102,7 +105,10 @@ bool tr_profile(TrProfile *p, int64_t distance, float start_rpm,
     p->v0=start_rpm*(16384.0f/60.0f);
     p->v1=end_rpm*(16384.0f/60.0f);
     if(distance==0 && fabsf(p->v0)<0.01f && end_rpm==0) return true;
-    /* Original model: a/1024 counts per 5 kHz tick squared. */
+    /* Legacy trajectory model: a/1024 counts per 5 kHz tick squared. The
+     * translator implements this profile itself and streams absolute FD
+     * setpoints with Emm acceleration=0, so legacy acceleration/end-speed
+     * semantics are not replaced by ZDT's different acceleration scale. */
     p->a=sign*(float)accel*(25000000.0f/1024.0f);
     vmax=sign*max_rpm*(16384.0f/60.0f);
     p->vc=vmax;
@@ -143,6 +149,10 @@ static void reply(uint8_t error, uint8_t stat_id)
     r[3]=error;
     if(stat_id) {
         n=15; m=&tr_motor[stat_id-1];
+        /* cmd_count and trap_status have no direct ZDT register because the
+         * STM32 now owns the legacy FIFO/trajectory. These two fields report
+         * the translator's real accepted-command/queue state. Physical fields
+         * below only come from actual motor telemetry. */
         put_le16(r+4,m->commands);
         r[6]=(uint8_t)(m->active || m->count);
         r[7]=(uint8_t)m->temperature;
@@ -155,7 +165,6 @@ static void reply(uint8_t error, uint8_t stat_id)
 static void reply_fw(uint8_t motor_id)
 {
     TrMotor *m=&tr_motor[motor_id-1];
-    /* Host firmware response: FF FF 09 id fw_hi fw_lo hw_series/type hw_ver crc. */
     uint8_t r[9]={0xFF,0xFF,9,motor_id,0,0,0,0,0};
     put_be16(r+4,m->fw_version);
     r[6]=(uint8_t)((m->hw_series<<4)|(m->hw_type&0x0F));
@@ -175,7 +184,7 @@ static void fail(uint8_t error)
     if(global_fault) return;
     global_fault=error;
     if(error==TR_DEADLINE) tr_diag.deadline_faults++;
-    emergency=2; /* FE broadcast, then F3 disable; never restart automatically. */
+    emergency=2;
     for(i=0;i<MOTOR_COUNT;i++) {
         tr_motor[i].fault=error; tr_motor[i].enabled=0;
         cancel_motor(&tr_motor[i]);
@@ -190,6 +199,18 @@ static bool fresh(TrMotor *m)
 {
     return (m->valid&3U)==3U && now-m->pos_us<=TR_FEEDBACK_US &&
            now-m->flags_us<=TR_FEEDBACK_US;
+}
+static bool status_ready(TrMotor *m)
+{
+    bool environment;
+    if(!fresh(m)) return false;
+    environment=(m->valid&8U) && now-m->voltage_us<=TR_ENVIRONMENT_US;
+    if(!environment) return false;
+    /* Some Emm/X42S firmware variants do not implement 0x39. -128 is an
+     * explicit unavailable sentinel only after the motor itself rejects 0x39;
+     * it is never invented as a temperature reading. */
+    if(m->no_temperature) return true;
+    return (m->valid&4U) && now-m->temp_us<=TR_ENVIRONMENT_US;
 }
 static bool send_bus(uint8_t kind, uint8_t id, uint8_t fn, uint8_t expected,
                      uint8_t value, const uint8_t *p, uint16_t n)
@@ -215,12 +236,15 @@ static bool read_bus(uint8_t kind, uint8_t id, uint8_t fn)
 static bool set_current(uint8_t kind, uint8_t i, uint8_t percent)
 {
     uint8_t c[7]={0,0x45,0x66,0,0,0,0x6B};
-    /* Preserve the original host current percentage. This is especially
-     * important for type-3 mechanical zero moves, which intentionally use
-     * low current instead of full motor current. */
+    uint32_t ma;
+    /* Emm Rev1.3 0x45/0x66 changes the closed-loop stall/max-current limit.
+     * svF=0 makes this a volatile per-segment translation, avoiding flash
+     * writes. The cached current is updated only after a successful ACK. */
     if(percent<1) percent=1;
     if(percent>100) percent=100;
-    c[0]=i+1; put_be16(c+4,(uint16_t)(TR_FULL_CURRENT_MA*percent/100U));
+    ma=(uint32_t)TR_FULL_CURRENT_MA*percent/100U;
+    if(ma>5000U) ma=5000U;
+    c[0]=i+1; put_be16(c+4,(uint16_t)ma);
     return send_bus(kind,i+1,0x45,4,percent,c,sizeof(c));
 }
 static void accept_feedback(uint8_t i, const uint8_t *r)
@@ -229,8 +253,6 @@ static void accept_feedback(uint8_t i, const uint8_t *r)
     int64_t value;
     if(r[1]==0x36) {
         value=be32(r+3);
-        /* X42S 0x36 position uses 65536 units per motor revolution while the
-         * original host uses 16384 counts/rev, therefore divide by four. */
         if(r[2]) value=-value;
         value=value*direction[i]/4+offset[i];
         if(value<INT32_MIN || value>INT32_MAX) { fail(TR_RANGE); return; }
@@ -240,8 +262,6 @@ static void accept_feedback(uint8_t i, const uint8_t *r)
         }
     } else if(r[1]==0x3A) {
         m->flags=r[2]; m->flags_us=now; m->valid|=2;
-        /* Bit 3 is Cgp_TF (stall protection was triggered), not a transport
-         * or driver-reply error. It may be set during a normal homing stop. */
     } else if(r[1]==0x39) {
         if(r[2]>1 || (r[2] && r[3]>127) || (!r[2] && r[3]>128)) { fail(TR_RANGE); return; }
         m->temperature=(int8_t)(r[2] ? (int)r[3] : -(int)r[3]);
@@ -256,6 +276,14 @@ static void accept_feedback(uint8_t i, const uint8_t *r)
         m->hw_type=(uint8_t)(r[4]&0x0F);
         m->hw_version=r[5];
     }
+}
+static bool ack_ok(uint8_t fn, uint8_t status)
+{
+    if(status==0x02) return true;
+    /* Emm motion commands also document 0x12/0x22 as non-error accepted
+     * states. 0x9F (reached) is handled separately before this function. */
+    if((fn==0xFD || fn==0xF6) && (status==0x12 || status==0x22)) return true;
+    return false;
 }
 static void motor_frame(const uint8_t *r, uint8_t n)
 {
@@ -286,25 +314,34 @@ static void motor_frame(const uint8_t *r, uint8_t n)
         bus.kind=0; bus_free_us=now+TR_BUS_GAP_US;
         return;
     }
-    if(r[1]==0 || (n==4 && bus.expected==4 && bus.function!=0x3A &&
-                   (r[2]==0xE2 || r[2]==0xEE || r[2]==0xEF))) {
+    if(r[1]==0 || (n==4 && bus.expected==4 && bus.function!=0x3A && !ack_ok(bus.function,r[2]))) {
         tr_diag.last_error_length=n<16 ? n : 16;
         memcpy(tr_diag.last_error_frame,r,tr_diag.last_error_length);
         bus.kind=0; bus_free_us=now+TR_BUS_GAP_US; fail(TR_MOTOR); return;
     }
     if(bus.function==0x42) {
-        if(n!=31 && n!=33 && n!=35) return;
+        if(n!=33) return;
     } else if(n!=bus.expected) return;
     kind=bus.kind; i=bus.id-1; value=bus.value;
     elapsed=now-bus.sent_us;
     if(elapsed>tr_diag.max_bus_transaction_us) tr_diag.max_bus_transaction_us=elapsed;
     bus.kind=0; bus_free_us=now+TR_BUS_GAP_US;
     if(r[1]==0x42) {
-        if((n!=31 && n!=33 && n!=35) || r[2]<0x19 ||
-           (r[7]!=MOTOR_MICROSTEP && r[9]!=MOTOR_MICROSTEP)) {
+        TrMotor *m=&tr_motor[i];
+        /* Rev1.3 Emm 0x42 response is exactly 33 bytes:
+         * [ID,42,21,15, 28 config bytes, 6B]. Require the settings that the
+         * translator's unit conversions and ACK handling depend on. */
+        if(r[2]!=0x21 || r[3]!=0x15 ||
+           r[6]!=0x02 ||                    /* P_Serial = UART */
+           r[9]!=MOTOR_MICROSTEP ||         /* 16 => 3200 pulses/rev */
+           r[18]!=0x05 ||                   /* 115200 baud */
+           r[20]!=(uint8_t)(i+1) ||         /* actual ID/address */
+           r[21]!=0x00 ||                   /* checksum = fixed 0x6B */
+           (r[22]!=0x01 && r[22]!=0x03)) {  /* Receive or Both */
             fail(TR_CONFIG); return;
         }
-        tr_motor[i].configured=1;
+        memcpy(m->config_raw,r+4,sizeof(m->config_raw));
+        m->configured=1;
     } else if(r[1]==0x45) tr_motor[i].current=value;
     else if(r[1]==0xF3) {
         tr_motor[i].enabled=value;
@@ -317,7 +354,7 @@ static void motor_frame(const uint8_t *r, uint8_t n)
         return;
     }
     if(kind==BUS_CONTROL && (request.kind==1 || request.kind==3)) request.step++;
-    if(kind==BUS_STARTUP) { startup_id++; }
+    if(kind==BUS_STARTUP) startup_id++;
     if(kind==BUS_HOME_STOP) {
         TrMotor *m=&tr_motor[i];
         m->last_sent=m->position;
@@ -351,12 +388,11 @@ void tr_motor_byte(uint8_t b, uint32_t t)
             case EMM_CMD_S_VER: n=7; break;
             case 0x42:
                 if(motor_used<3) return;
-                n=(motor_rx[2]==0x19 || motor_rx[2]==0x1d) ?
-                  (uint8_t)(motor_rx[2]+6U) : motor_rx[2];
+                n=motor_rx[2];
                 if(n<5 || n>sizeof(motor_rx)) n=0;
                 break;
-            case 0: case 0x0A: case 0x3A: case 0x45: case 0x46: case 0x9A: case 0xF3:
-            case 0xFD: case 0xFE: case 0x0E: n=4; break;
+            case 0: case 0x0A: case 0x3A: case 0x45: case 0x46: case 0x4F:
+            case 0x9A: case 0xF3: case 0xFD: case 0xFE: case 0x0E: n=4; break;
             default: break;
             }
         }
@@ -383,9 +419,6 @@ static void host_frame(const uint8_t *r, uint8_t n)
     float velocity;
     if(r[3]<1 || r[3]>MOTOR_COUNT) { reply(TR_FRAME,0); return; }
     if(n==7 && r[3]==1 && r[4]==0 && r[5]==0) {
-        /* Maintenance reset: make current physical position the ZDT origin.
-         * Completion is synchronous from the host's point of view: do not
-         * reply TR_OK until all four 0x0A resets and fresh 0x36/0x3A reads finish. */
         if(request.kind==2) request.kind=0;
         if(request.kind || bus.kind || !tr_bus_idle() || !due(bus_free_us) || motion_pending()) {
             reply(TR_BUSY,0); return;
@@ -440,11 +473,9 @@ static void host_frame(const uint8_t *r, uint8_t n)
         reply(global_fault,category==0 ? ids[0]+1 : 0); return;
     }
     if(category==0) {
-        if(fresh(&tr_motor[ids[0]])) {
-            tr_motor[ids[0]].commands++;
-            reply(TR_OK,ids[0]+1);
-            return;
-        }
+        /* A status request must obtain new physical position and flags after
+         * this request was received. Environment data may be reused only
+         * inside its bounded freshness window. */
         request.kind=2; request.id=ids[0]; request.since=now;
         tr_motor[ids[0]].commands++;
         return;
@@ -533,13 +564,6 @@ static void control_service(void)
     if(i==MOTOR_COUNT) { request.kind=0; reply(TR_OK,0); return; }
     m=&tr_motor[i]; en=(request.enables>>i)&1U;
     if(request.kind==3) {
-        /* Per motor reset transaction:
-         * step 0: 0x0A/0x6D reset current position to zero
-         * step 1: fresh 0x36 position read
-         * step 2: fresh 0x3A status read
-         * step 3: verify and advance to next motor.
-         * The 0x0A ACK is optional on some firmware; timeout handling below
-         * advances only that first step, never skips telemetry verification. */
         if(request.step==0) {
             uint8_t reset[4]={(uint8_t)(i+1),0x0A,0x6D,0x6B};
             send_bus(BUS_CONTROL,i+1,0x0A,4,0,reset,4);
@@ -572,29 +596,53 @@ static void control_service(void)
         request.stops&=(uint8_t)~(1U<<i);
         request.id++; request.step=0; return;
     }
-    if(en && m->enabled && request.step==0) { request.id++; return; }
-    c[0]=i+1;
-    if(!en) {
-        if(request.step==0) {
-            c[1]=0xF3; c[2]=0xAB;
-            send_bus(BUS_CONTROL,i+1,0xF3,4,0,c,6); return;
+    if(en) {
+        switch(request.step) {
+        case 0:
+            /* Do not claim compatibility until the real 0x42 configuration
+             * response verifies UART, 115200, fixed 6B, 16 microsteps, ID and
+             * an ACK-producing response mode. */
+            m->configured=0;
+            read_bus(BUS_CONTROL,i+1,0x42);
+            return;
+        case 1: {
+            /* Emm S_Vel_IS must be disabled so a legacy speed of N RPM means
+             * N RPM, not N/10. svF=0 avoids persistent configuration writes. */
+            uint8_t scale[6]={(uint8_t)(i+1),0x4F,0x71,0,0,0x6B};
+            send_bus(BUS_CONTROL,i+1,0x4F,4,0,scale,sizeof(scale));
+            return;
+        }
+        case 2:
+            c[0]=i+1; c[1]=0xF3; c[2]=0xAB; c[3]=1;
+            send_bus(BUS_CONTROL,i+1,0xF3,4,1,c,6); return;
+        case 3: read_bus(BUS_CONTROL,i+1,0x36); return;
+        case 4: read_bus(BUS_CONTROL,i+1,0x3A); return;
+        case 5:
+            if(!m->no_temperature) { read_bus(BUS_CONTROL,i+1,0x39); return; }
+            request.step++;
+            return;
+        case 6: read_bus(BUS_CONTROL,i+1,0x24); return;
+        default:
+            if(!m->configured || !(m->flags&1U) || !status_ready(m)) {
+                request.kind=0; reply(TR_CONFIG,0); return;
+            }
+            m->fault=0; m->last_sent=m->position;
+            request.id++; request.step=0;
+            return;
         }
     } else {
         switch(request.step) {
-        case 0: m->configured=1; request.step++; return;
-        case 1: request.step++; return;
-        case 2: request.step++; return;
-        case 3: c[1]=0xF3; c[2]=0xAB; c[3]=1;
-                send_bus(BUS_CONTROL,i+1,0xF3,4,1,c,6); return;
-        case 4: read_bus(BUS_CONTROL,i+1,0x36); return;
-        case 5: read_bus(BUS_CONTROL,i+1,0x3A); return;
-        case 6: read_bus(BUS_CONTROL,i+1,0x39); return;
-        case 7: read_bus(BUS_CONTROL,i+1,0x24); return;
-        default: break;
+        case 0:
+            c[0]=i+1; c[1]=0xF3; c[2]=0xAB; c[3]=0;
+            send_bus(BUS_CONTROL,i+1,0xF3,4,0,c,6); return;
+        case 1:
+            read_bus(BUS_CONTROL,i+1,0x3A); return;
+        default:
+            if(m->flags&1U) { request.kind=0; reply(TR_MOTOR,0); return; }
+            request.id++; request.step=0;
+            return;
         }
-        m->fault=0; m->last_sent=m->position;
     }
-    request.id++; request.step=0;
 }
 static bool group_at_heads(TrSegment *s)
 {
@@ -722,11 +770,6 @@ static bool stream_tick(void)
                 m->cruise_until_us=m->start_us+(uint32_t)((p->ta+p->tv)*1000000.0f);
             }
         }
-        /* Do not wrap arm coordinates to one revolution. X42S 0x36 is a
-         * multi-turn coordinate (65536 feedback units/rev), and the original
-         * host intentionally carries revolution information in its 16384-count
-         * absolute targets. tr_counts_to_pulses() performs the only required
-         * 16384 -> 3200 (at 16 microsteps) command conversion. */
         pulses=tr_counts_to_pulses(i,wire_target);
         packet[n++]=i+1; packet[n++]=0xFD;
         packet[n++]=pulses<0 ? 1 : 0;
@@ -744,7 +787,11 @@ static bool stream_tick(void)
         tr_diag.stream_packets++;
         return true;
     }
-    packet[n++]=0x6B; put_be16(packet+2,n);
+    /* X42S multi-motor format is 00 AA + 16-bit total subcommand-byte length
+     * + complete commands + final 6B. It is not RS485-specific and remains a
+     * TTL UART frame. Only address 1 may acknowledge the batch; physical
+     * completion is therefore always determined from subsequent 0x36/0x3A. */
+    packet[n++]=0x6B; put_be16(packet+2,(uint16_t)(n-5U));
     if(!send_bus(BUS_STREAM,1,0xFD,4,0,packet,n)) return false;
     tr_diag.stream_packets++;
     return true;
@@ -754,13 +801,15 @@ static void check_motion(void)
     uint8_t i;
     for(i=0;i<MOTOR_COUNT;i++) {
         TrMotor *m=&tr_motor[i]; TrSegment *s;
-        bool stationary, settled, clamp;
+        bool stationary, settled, clamp, reached;
         if(!m->active) continue;
         if(!fresh(m)) { fail(TR_STALE); return; }
         s=front(m);
         stationary=now-m->stable_us>=TR_STATIONARY_US && now-m->start_us>=TR_HOME_MIN_US;
         settled=due(m->finish_us) && (int32_t)(m->pos_us-m->finish_us)>0 &&
                 (int32_t)(m->flags_us-m->finish_us)>0;
+        reached=(m->flags&2U) && abs64((int64_t)m->position-s->target)<=TR_REACH_COUNTS;
+        if(!s->home && (m->flags&4U)) { fail(TR_STALL); return; }
         if(s->home && (m->flags&4U)) {
             m->active=2;
             continue;
@@ -771,15 +820,15 @@ static void check_motion(void)
             continue;
         }
         if(!settled || s->end_rpm) continue;
-        if(abs64((int64_t)m->position-s->target)<=TR_REACH_COUNTS ||
-           (clamp && stationary)) {
+        if(reached || (clamp && stationary)) {
             m->holding=clamp ? 1 : 0;
             m->active=0; m->carry_rpm=0;
             m->head=(uint8_t)((m->head+1)%TR_QUEUE_SIZE); m->count--;
         } else if(now-m->finish_us>TR_SETTLE_US) {
-            m->holding=clamp ? 1 : 0;
-            m->active=0; m->carry_rpm=0;
-            m->head=(uint8_t)((m->head+1)%TR_QUEUE_SIZE); m->count--;
+            /* Never fabricate completion. A normal segment that has not
+             * physically reached the final target after the settle window is
+             * a failed/stalled translation, not a successful legacy trap. */
+            fail(TR_STALL); return;
         }
     }
 }
@@ -802,20 +851,20 @@ static void feedback_service(void)
     }
     if(request.kind==2) {
         m=&tr_motor[request.id];
-        if(!global_fault && fresh(m) &&
-           (int32_t)(m->pos_us-request.since)>=0) {
-            uint8_t id=request.id; request.kind=0; reply(0,id+1); return;
-        }
-        if(oldest_id && oldest_id!=(uint8_t)(request.id+1) && spare_time(3600)) {
-            read_bus(BUS_FEEDBACK,oldest_id,functions[oldest_field]); return;
+        if(status_ready(m) &&
+           (int32_t)(m->pos_us-request.since)>=0 &&
+           (int32_t)(m->flags_us-request.since)>=0) {
+            uint8_t id=request.id; request.kind=0; reply(TR_OK,id+1); return;
         }
         if(spare_time(3600)) {
-            field=0;
-            if((m->valid&1) && (int32_t)(m->pos_us-request.since)>=0) {
-                if(!(m->valid&2) || now-m->flags_us>TR_FEEDBACK_US/2) field=1;
-                else if(!m->no_temperature && (!(m->valid&4) || now-m->temp_us>TR_ENVIRONMENT_US)) field=2;
-                else if(!(m->valid&8) || now-m->voltage_us>TR_ENVIRONMENT_US) field=3;
-            }
+            /* For every legacy STAT, position and flags must be newly read
+             * after the host request. Temperature/voltage may be reused only
+             * within their explicit freshness interval. */
+            if(!(m->valid&1) || (int32_t)(m->pos_us-request.since)<0) field=0;
+            else if(!(m->valid&2) || (int32_t)(m->flags_us-request.since)<0) field=1;
+            else if(!m->no_temperature && (!(m->valid&4) || now-m->temp_us>TR_ENVIRONMENT_US)) field=2;
+            else if(!(m->valid&8) || now-m->voltage_us>TR_ENVIRONMENT_US) field=3;
+            else field=0;
             read_bus(BUS_FEEDBACK,request.id+1,functions[field]);
             return;
         }
@@ -862,23 +911,23 @@ void tr_poll(uint32_t t)
                 request.kind=0; reply(TR_TIMEOUT,id);
             }
         } else if(request.kind==3 && bus.kind==BUS_CONTROL) {
-            /* Only 0x0A is allowed to be write-only. Position/status reads are
-             * mandatory because they prove the new coordinate origin is usable. */
             uint8_t fn=bus.function;
             bus.kind=0; bus_free_us=now+TR_BUS_GAP_US;
             tr_diag.timeouts++;
-            if(fn==0x0A && request.step==0) {
-                request.step=1;
-            } else {
-                request.kind=0;
-                reply(TR_TIMEOUT,0);
-            }
+            /* Some firmware revisions may omit the reset ACK. That omission
+             * is never treated as reset success: we advance only to mandatory
+             * 0x36/0x3A verification. */
+            if(fn==0x0A && request.step==0) request.step=1;
+            else { request.kind=0; reply(TR_TIMEOUT,0); }
         } else if(request.kind==4) {
             bus.kind=0; bus_free_us=now+TR_BUS_GAP_US;
             tr_diag.timeouts++;
             request.kind=0;
             reply(TR_TIMEOUT,0);
         } else if(bus.kind==BUS_STREAM) {
+            /* X42S 0xAA batches do not provide one ACK per contained motor.
+             * Do not fabricate an ACK; clear the transaction slot and let
+             * mandatory 0x36/0x3A telemetry decide physical completion. */
             bus.kind=0; bus_free_us=now+TR_BUS_GAP_US;
             tr_diag.timeouts++;
         } else {
@@ -888,11 +937,12 @@ void tr_poll(uint32_t t)
     if(request.kind==2 && now-request.since>100000UL) {
         uint8_t id=request.id;
         request.kind=0;
-        reply(0,id+1);
+        /* Previous code returned TR_OK here without motor data. Never do that. */
+        reply(TR_TIMEOUT,id+1);
     } else if(request.kind && now-request.since>900000UL) {
         uint8_t kind=request.kind;
         request.kind=0;
-        if(kind==3) reply(TR_TIMEOUT,0);
+        if(kind==3 || kind==1 || kind==4) reply(TR_TIMEOUT,0);
         else fail(TR_TIMEOUT);
     }
     if(global_fault) {
