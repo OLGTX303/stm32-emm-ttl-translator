@@ -16,8 +16,7 @@
 #define TR_STATIONARY_US 100000UL
 #define TR_STATIONARY_COUNTS 8L
 /* 40 legacy counts = 0.879 deg at 16384 counts/rev, closely matching the
- * Emm Rev1.3 default 0.8 deg position-reached window. The old 512-count
- * threshold was 11.25 deg and could falsely report a cube move complete. */
+ * Emm Rev1.3 default 0.8 deg position-reached window. */
 #define TR_REACH_COUNTS 40L
 #define TR_FULL_CURRENT_MA 2500U
 #define TR_MAX_RPM 3000U
@@ -25,8 +24,15 @@
 #define MOTOR_STEPS_PER_REV 200U
 #define MOTOR_MICROSTEP 16U
 #define MOTOR_PULSES_PER_REV (MOTOR_STEPS_PER_REV * MOTOR_MICROSTEP)
-/* Physical IDs match the software. Signs/offsets require unloaded measurement.
- * Do not import the incompatible A5 application's arm/finger mapping. */
+
+/* The PC/cube_motion.py logical IDs are intentionally unchanged:
+ *   logical 1 = right finger, logical 2 = right arm,
+ *   logical 3 = left finger,  logical 4 = left arm.
+ * The installed ZDT addresses are:
+ *   physical 1 = right arm,   physical 2 = right finger,
+ *   physical 3 = left arm,    physical 4 = left finger.
+ * Translation must happen only on the motor-side UART. */
+#define TR_PHYSICAL_ID_INITIALIZER {2U, 1U, 4U, 3U}
 #define TR_DIRECTION_INITIALIZER {1, 1, 1, 1}
 #define TR_OFFSET_INITIALIZER {0, 0, 0, 0}
 #define MOTOR_ID_RIGHT_FINGER 1U
