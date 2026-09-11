@@ -688,13 +688,16 @@ static bool stream_tick(void)
                 m->cruise_until_us=m->start_us+(uint32_t)((p->ta+p->tv)*1000000.0f);
             }
         }
-        pulses=tr_counts_to_pulses(i,wire_target);
+        /* EMM legacy/single-round mode expects a relative pulse distance.
+         * The host API remains absolute encoder counts, so convert the
+         * requested target against the latest measured position. */
+        pulses=tr_counts_to_pulses(i,wire_target)-tr_counts_to_pulses(i,m->position);
         packet[n++]=i+1; packet[n++]=0xFD;
         packet[n++]=pulses<0 ? 1 : 0;
         put_be16(packet+n,rpm); n+=2;
         packet[n++]=0; /* STM32 generates acceleration. */
         put_be32(packet+n,(uint32_t)abs64(pulses)); n+=4;
-        packet[n++]=1; /* absolute motor coordinate */
+        packet[n++]=0; /* relative/single-round pulse distance */
         packet[n++]=0; /* AA batch: no unsolicited reached replies */
         packet[n++]=0x6B;
         m->last_sent=target; m->last_sample_us=sample;

@@ -88,7 +88,8 @@ class Simulator:
         if code == 0xFD:
             j = ident-1
             sign = -1 if packet[2] else 1
-            self.targets[j] = sign*int.from_bytes(packet[6:10], 'big')*16384/3200
+            distance = sign*int.from_bytes(packet[6:10], 'big')*16384/3200
+            self.targets[j] = (self.positions[j] + distance) if packet[10] == 0 else distance
             self.rpm[j] = int.from_bytes(packet[3:5], 'big')
             if self.stale_notifications:
                 self.schedule(self.t+50, bytes([1, 0xFD, 0x9F, 0x6B]))
