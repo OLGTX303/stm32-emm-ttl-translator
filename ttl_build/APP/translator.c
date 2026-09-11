@@ -354,6 +354,15 @@ static void host_frame(const uint8_t *r, uint8_t n)
     int32_t start;
     float velocity;
     if(r[3]<1 || r[3]>MOTOR_COUNT) { reply(TR_FRAME,0); return; }
+    if(n==7 && r[3]==1 && r[4]==0 && r[5]==0) {
+        /* Maintenance command: manually align the mechanism, then clear all
+         * four EMM encoder origins with 0x0A/0x6D. */
+        if(request.kind) { reply(TR_BUSY,0); return; }
+        request.kind=3; request.mask=(uint8_t)((1U<<MOTOR_COUNT)-1U);
+        request.enables=0; request.stops=0; request.id=0; request.step=0;
+        request.since=now;
+        return;
+    }
     memset(segments,0,sizeof(segments));
     for(i=0;i<r[3];i++) {
         if(pos+2U>n-1U) { error=TR_FRAME; break; }
@@ -383,16 +392,6 @@ static void host_frame(const uint8_t *r, uint8_t n)
     }
     if(!error && pos!=n-1) error=TR_FRAME;
     if(error) { reply(error,0); return; }
-    /* Special maintenance command: FF FF 07 01 00 00 CRC.
-     * After the operator manually holds the mechanism at the horizon, send
-     * EMM V5 0x0A/0x6D to every motor and clear all four encoder origins. */
-    if(r[3]==1 && r[4]==0 && r[5]==0) {
-        if(request.kind) { reply(TR_BUSY,0); return; }
-        request.kind=3; request.mask=(uint8_t)((1U<<MOTOR_COUNT)-1U);
-        request.enables=0; request.stops=0; request.id=0; request.step=0;
-        request.since=now;
-        return;
-    }
     if(request.kind) { reply(TR_BUSY,category==0 ? ids[0]+1 : 0); return; }
     /* A disable is the per-motor recovery path after transport/motor faults;
      * do not require the host to know the faulted set or issue an all-axis
