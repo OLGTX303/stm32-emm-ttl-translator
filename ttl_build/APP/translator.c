@@ -707,7 +707,11 @@ static void check_motion(void)
         }
         if((m->flags&4U) && !s->home && !clamp) { fail(TR_STALL); return; }
         if(!settled || s->end_rpm) continue;
-        if((abs64((int64_t)m->position-s->target)<=TR_REACH_COUNTS && (m->flags&2U)) ||
+        /* EMM V5 position-reached is not asserted consistently on all
+         * firmware revisions. For homing, the measured encoder position and
+         * stationary state are authoritative once inside the tolerance. */
+        if((abs64((int64_t)m->position-s->target)<=TR_REACH_COUNTS &&
+            ((m->flags&2U) || s->home)) ||
            (clamp && stationary)) {
             m->holding=clamp ? 1 : 0;
             m->active=0; m->carry_rpm=0;
