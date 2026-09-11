@@ -24,6 +24,8 @@ static struct {
     uint32_t since;
 } request;
 
+static void cancel_motor(TrMotor *m);
+
 static uint16_t le16(const uint8_t *p) { return (uint16_t)(p[0] | ((uint16_t)p[1] << 8)); }
 static int32_t le32s(const uint8_t *p)
 {
