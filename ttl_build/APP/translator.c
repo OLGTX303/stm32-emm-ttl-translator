@@ -8,7 +8,7 @@ TrDiagnostics tr_diag;
 static const int8_t direction[MOTOR_COUNT] = TR_DIRECTION_INITIALIZER;
 static const int32_t offset[MOTOR_COUNT] = TR_OFFSET_INITIALIZER;
 static uint32_t now, next_tick, group_id, bus_free_us;
-static uint8_t global_fault, emergency, poll_motor, poll_field, startup_id, reset_mask;
+static uint8_t global_fault, emergency, poll_motor, poll_field, startup_id;
 static uint8_t host_rx[128], motor_rx[64];
 static uint16_t host_used, motor_used;
 static uint32_t host_byte_us, motor_byte_us;
@@ -48,6 +48,29 @@ static bool moving(void)
     for(i=0;i<MOTOR_COUNT;i++) if(tr_motor[i].active) return true;
     return false;
 }
+static bool motion_pending(void)
+{
+    uint8_t i;
+    for(i=0;i<MOTOR_COUNT;i++) if(tr_motor[i].active || tr_motor[i].count) return true;
+    return false;
+}
+static void reset_cached_origin(TrMotor *m)
+{
+    cancel_motor(m);
+    m->position=0;
+    m->start_position=0;
+    m->last_sent=0;
+    m->stationary_position=0;
+    m->carry_rpm=0.0f;
+    m->holding=0;
+    m->flags=0;
+    /* Never treat telemetry from the coordinate system before 0x0A/0x6D as
+     * valid after the encoder origin changes. 0x36 and 0x3A must repopulate it. */
+    m->valid=0;
+    m->pos_us=0;
+    m->flags_us=0;
+    m->stable_us=now;
+}
 uint8_t tr_crc8(const uint8_t *p, uint16_t n)
 {
     uint8_t crc=0, b, j;
@@ -63,6 +86,7 @@ uint8_t tr_crc8(const uint8_t *p, uint16_t n)
 int64_t tr_counts_to_pulses(uint8_t i, int32_t counts)
 {
     int64_t v=((int64_t)counts-offset[i])*direction[i]*MOTOR_PULSES_PER_REV;
+    /* Old controller: 16384 counts/rev. ZDT 0xFD: 200*microstep pulses/rev. */
     return v < 0 ? -((-v+8192)/16384) : (v+8192)/16384;
 }
 bool tr_profile(TrProfile *p, int64_t distance, float start_rpm,
@@ -189,10 +213,11 @@ static bool read_bus(uint8_t kind, uint8_t id, uint8_t fn)
 static bool set_current(uint8_t kind, uint8_t i, uint8_t percent)
 {
     uint8_t c[7]={0,0x45,0x66,0,0,0,0x6B};
-    /* The coupled twist moves a finger and geared arm together. Use full
-     * drive current for every motion segment so the finger does not lose
-     * torque at the legacy 40%% clamp setting. */
-    percent=100;
+    /* Preserve the original host current percentage. This is especially
+     * important for type-3 mechanical zero moves, which intentionally use
+     * low current instead of full motor current. */
+    if(percent<1) percent=1;
+    if(percent>100) percent=100;
     c[0]=i+1; put_be16(c+4,(uint16_t)(TR_FULL_CURRENT_MA*percent/100U));
     return send_bus(kind,i+1,0x45,4,percent,c,sizeof(c));
 }
@@ -202,9 +227,8 @@ static void accept_feedback(uint8_t i, const uint8_t *r)
     int64_t value;
     if(r[1]==0x36) {
         value=be32(r+3);
-        /* The documented sign is 0/1; tolerate other nonzero encodings
-         * emitted by older X42S revisions instead of converting a valid
-         * negative position sample into a latched motor fault. */
+        /* X42S 0x36 position uses 65536 units per motor revolution while the
+         * original host uses 16384 counts/rev, therefore divide by four. */
         if(r[2]) value=-value;
         value=value*direction[i]/4+offset[i];
         if(value<INT32_MIN || value>INT32_MAX) { fail(TR_RANGE); return; }
@@ -214,19 +238,14 @@ static void accept_feedback(uint8_t i, const uint8_t *r)
         }
     } else if(r[1]==0x3A) {
         m->flags=r[2]; m->flags_us=now; m->valid|=2;
-        /* X42S 0x3A uses several low bits for normal enabled/motion state;
-         * 0x07 is the normal closed-loop running value. Bit 3 is the
-         * documented driver fault indication. */
         /* Bit 3 is Cgp_TF (stall protection was triggered), not a transport
-         * or driver-reply error.  It may be set by the EMM during a normal
-         * homing stop; motion policy consumes the individual Cgi_TF bit. */
+         * or driver-reply error. It may be set during a normal homing stop. */
     } else if(r[1]==0x39) {
         if(r[2]>1 || (r[2] && r[3]>127) || (!r[2] && r[3]>128)) { fail(TR_RANGE); return; }
         m->temperature=(int8_t)(r[2] ? (int)r[3] : -(int)r[3]);
         m->temp_us=now; m->valid|=4;
     } else if(r[1]==0x24) {
         m->voltage=be16(r+2);
-        /* Host wire field is signed int16 mV: do not wrap >32.767 V. */
         if(m->voltage>32767 || m->voltage<10000) { fail(TR_RANGE); return; }
         m->voltage_us=now; m->valid|=8;
     } else if(r[1]==EMM_CMD_S_VER) {
@@ -242,9 +261,6 @@ static void motor_frame(const uint8_t *r, uint8_t n)
     uint32_t elapsed;
     tr_diag.motor_frames++;
     if(n==4 && r[2]==0x9F) {
-        /* A reached notification is normally unsolicited.  For a direct FD
-         * stream transaction it is the configured acknowledgement and must
-         * release the bus; otherwise the next host status request times out. */
         if(bus.kind==BUS_STREAM && r[0]==bus.id && (r[1]==bus.function || r[1]==0)) {
             bus.kind=0; bus_free_us=now+TR_BUS_GAP_US;
         } else if(bus.kind==BUS_HOME_STOP && r[0]==bus.id && (r[1]==bus.function || r[1]==0)) {
@@ -257,15 +273,9 @@ static void motor_frame(const uint8_t *r, uint8_t n)
         }
         return;
     }
-    /* Some X42S units emit a shortened broadcast 0xEE notification after a
-     * stop/position transition.  It has no address and is not a command
-     * rejection; discard it so it cannot poison the shared bus transaction. */
     if(n==4 && r[0]==0 && r[1]==0xEE && r[2]==0x6B) return;
     if(!bus.kind || r[0]!=bus.id) return;
     if(r[1]!=bus.function && r[1]!=0) return;
-    /* Some fitted EMM revisions explicitly reject the X42S temperature query.
-     * Preserve the signed host field as UNKNOWN (-128), never invent 0 C.
-     * Only the exact unsupported-command reply is eligible, not a timeout. */
     if(bus.function==0x39 && n==4 && (r[1]==0 || r[1]==0x39) && r[2]==0xEE) {
         TrMotor *m=&tr_motor[bus.id-1];
         m->no_temperature=1; m->temperature=-128; m->valid|=4; m->temp_us=now;
@@ -281,8 +291,6 @@ static void motor_frame(const uint8_t *r, uint8_t n)
         bus.kind=0; bus_free_us=now+TR_BUS_GAP_US; fail(TR_MOTOR); return;
     }
     if(bus.function==0x42) {
-        /* X42S firmware revisions return either the 25-byte or 29-byte
-         * configuration payload (31/35 bytes including framing). */
         if(n!=31 && n!=33 && n!=35) return;
     } else if(n!=bus.expected) return;
     kind=bus.kind; i=bus.id-1; value=bus.value;
@@ -290,8 +298,6 @@ static void motor_frame(const uint8_t *r, uint8_t n)
     if(elapsed>tr_diag.max_bus_transaction_us) tr_diag.max_bus_transaction_us=elapsed;
     bus.kind=0; bus_free_us=now+TR_BUS_GAP_US;
     if(r[1]==0x42) {
-        /* X42S EMM 33-byte config, not the incompatible X 37-byte layout.
-         * Manual V1.0.5 pp104-107. Receive-only avoids shared TX collisions. */
         if((n!=31 && n!=33 && n!=35) || r[2]<0x19 ||
            (r[7]!=MOTOR_MICROSTEP && r[9]!=MOTOR_MICROSTEP)) {
             fail(TR_CONFIG); return;
@@ -343,8 +349,6 @@ void tr_motor_byte(uint8_t b, uint32_t t)
             case EMM_CMD_S_VER: n=7; break;
             case 0x42:
                 if(motor_used<3) return;
-                /* Length byte counts the configuration payload; include
-                 * address, function, length and trailing 6B framing. */
                 n=(motor_rx[2]==0x19 || motor_rx[2]==0x1d) ?
                   (uint8_t)(motor_rx[2]+6U) : motor_rx[2];
                 if(n<5 || n>sizeof(motor_rx)) n=0;
@@ -377,20 +381,22 @@ static void host_frame(const uint8_t *r, uint8_t n)
     float velocity;
     if(r[3]<1 || r[3]>MOTOR_COUNT) { reply(TR_FRAME,0); return; }
     if(n==7 && r[3]==1 && r[4]==0 && r[5]==0) {
-        /* Maintenance command: manually align the mechanism, then clear all
-         * four EMM encoder origins with 0x0A/0x6D. */
-        /* A stale explicit status request must not block this recovery
-         * operation after a disconnected/reconnected motor bus. */
+        /* Maintenance reset: make current physical position the ZDT origin.
+         * Completion is synchronous from the host's point of view: do not
+         * reply TR_OK until all four 0x0A resets and fresh 0x36/0x3A reads finish. */
         if(request.kind==2) request.kind=0;
-        if(request.kind || bus.kind || !tr_bus_idle() || !due(bus_free_us)) {
+        if(request.kind || bus.kind || !tr_bus_idle() || !due(bus_free_us) || motion_pending()) {
             reply(TR_BUSY,0); return;
         }
-        reset_mask=(uint8_t)((1U<<MOTOR_COUNT)-1U);
-        reply(TR_OK,0);
+        for(i=0;i<MOTOR_COUNT;i++) reset_cached_origin(&tr_motor[i]);
+        request.kind=3;
+        request.mask=(uint8_t)((1U<<MOTOR_COUNT)-1U);
+        request.id=0;
+        request.step=0;
+        request.since=now;
         return;
     }
     if(n==7 && r[3]==1 && r[4]>=1 && r[4]<=MOTOR_COUNT && r[5]==EMM_CMD_S_VER) {
-        /* Maintenance query: read the EMM firmware/hardware identification. */
         if(request.kind || bus.kind || !tr_bus_idle() || !due(bus_free_us)) {
             reply(TR_BUSY,0); return;
         }
@@ -428,15 +434,10 @@ static void host_frame(const uint8_t *r, uint8_t n)
     if(!error && pos!=n-1) error=TR_FRAME;
     if(error) { reply(error,0); return; }
     if(request.kind) { reply(TR_BUSY,category==0 ? ids[0]+1 : 0); return; }
-    /* A disable is the per-motor recovery path after transport/motor faults;
-     * do not require the host to know the faulted set or issue an all-axis
-     * packet before it can regain control of one axis. */
     if(global_fault && !(category==1 && enables==0)) {
         reply(global_fault,category==0 ? ids[0]+1 : 0); return;
     }
     if(category==0) {
-        /* Status is safe to answer from the most recent coherent sample;
-         * avoid making the host wait behind an unrelated bus transaction. */
         if(fresh(&tr_motor[ids[0]])) {
             tr_motor[ids[0]].commands++;
             reply(TR_OK,ids[0]+1);
@@ -448,8 +449,6 @@ static void host_frame(const uint8_t *r, uint8_t n)
     }
     if(category==1) {
         uint8_t cancel=(uint8_t)(mask & (uint8_t)~enables), previous, j;
-        /* Stop/cancel linked queue groups as a unit; unrelated axes continue.
-         * Peers are stopped holding position, only requested IDs are disabled. */
         do {
             previous=cancel;
             for(i=0;i<MOTOR_COUNT;i++) if(cancel&(1U<<i)) {
@@ -497,7 +496,7 @@ static void host_frame(const uint8_t *r, uint8_t n)
         m->count++; m->commands++;
     }
     tr_diag.host_frames++;
-    reply(TR_OK,0); /* Accepted into reserved queues, not motion-completed. */
+    reply(TR_OK,0);
 }
 void tr_host_byte(uint8_t b, uint32_t t)
 {
@@ -532,9 +531,31 @@ static void control_service(void)
     if(i==MOTOR_COUNT) { request.kind=0; reply(TR_OK,0); return; }
     m=&tr_motor[i]; en=(request.enables>>i)&1U;
     if(request.kind==3) {
-        uint8_t reset[4]={(uint8_t)(i+1),0x0A,0x6D,0x6B};
-        send_bus(BUS_CONTROL,i+1,0x0A,4,0,reset,4);
+        /* Per motor reset transaction:
+         * step 0: 0x0A/0x6D reset current position to zero
+         * step 1: fresh 0x36 position read
+         * step 2: fresh 0x3A status read
+         * step 3: verify and advance to next motor.
+         * The 0x0A ACK is optional on some firmware; timeout handling below
+         * advances only that first step, never skips telemetry verification. */
+        if(request.step==0) {
+            uint8_t reset[4]={(uint8_t)(i+1),0x0A,0x6D,0x6B};
+            send_bus(BUS_CONTROL,i+1,0x0A,4,0,reset,4);
+            return;
+        }
+        if(request.step==1) { read_bus(BUS_CONTROL,i+1,0x36); return; }
+        if(request.step==2) { read_bus(BUS_CONTROL,i+1,0x3A); return; }
+        if((m->valid&3U)!=3U || abs64((int64_t)m->position)>TR_STATIONARY_COUNTS) {
+            request.kind=0;
+            reply(TR_MOTOR,0);
+            return;
+        }
+        m->start_position=m->position;
+        m->last_sent=m->position;
+        m->stationary_position=m->position;
+        m->stable_us=now;
         request.id++;
+        request.step=0;
         return;
     }
     if(request.kind==4) {
@@ -557,21 +578,10 @@ static void control_service(void)
             send_bus(BUS_CONTROL,i+1,0xF3,4,0,c,6); return;
         }
     } else {
-        /* Read/verify EMM configuration before enabling. No flash writes. */
         switch(request.step) {
-        case 0:
-                /* Version probing is optional: older EMM V5 builds do not
-                 * answer 0x1F. Keep enable independent of that query. */
-                m->configured=1; request.step++; return;
-        case 1:
-                /* The X42S TTL firmware reports closed-loop mode in 0x42
-                 * configuration and does not ACK the legacy 0x46 setter.
-                 * Treat the verified configuration as authoritative. */
-                request.step++; return;
-        case 2:
-                /* Current is applied with each motion segment. Some EMM
-                 * revisions do not reply to the optional 0x45 setup write. */
-                request.step++; return;
+        case 0: m->configured=1; request.step++; return;
+        case 1: request.step++; return;
+        case 2: request.step++; return;
         case 3: c[1]=0xF3; c[2]=0xAB; c[3]=1;
                 send_bus(BUS_CONTROL,i+1,0xF3,4,1,c,6); return;
         case 4: read_bus(BUS_CONTROL,i+1,0x36); return;
@@ -636,7 +646,6 @@ static void finish_segments(uint32_t sample)
         s=front(m);
         if((int32_t)(sample-m->finish_us)<0) continue;
         if(s->end_rpm) {
-            /* Do not silently stop at a waypoint requiring velocity continuity. */
             if(m->count<2) { fail(TR_UNDERRUN); return; }
             m->start_position=s->target; m->start_us=m->finish_us; m->carry_rpm=s->end_rpm;
             m->active=0; m->head=(uint8_t)((m->head+1)%TR_QUEUE_SIZE); m->count--;
@@ -671,7 +680,6 @@ static bool stream_tick(void)
     int32_t target, wire_target;
     int64_t pulses, delta;
     uint16_t rpm;
-    /* Complete v1 waypoints before activating their next queued segment. */
     start_groups(start);
     for(pass=0;pass<TR_QUEUE_SIZE;pass++) {
         finish_segments(sample);
@@ -687,15 +695,11 @@ static bool stream_tick(void)
             continue;
         }
         if(!fresh(m)) { fail(TR_STALE); return false; }
-        /* Once the final setpoint is on the wire, retain its approach speed.
-         * Reissuing the same target at 1 RPM would slow a lagging motor to a
-         * crawl and cause false settling failures. Feedback owns completion. */
         if((int32_t)(m->last_sample_us-m->finish_us)>=0) continue;
         d=tr_profile_position(&m->profile,(float)(sample-m->start_us)*0.000001f);
         delta=(int64_t)m->start_position+(int64_t)(d<0 ? d-0.5f : d+0.5f);
         if(delta<INT32_MIN || delta>INT32_MAX) { fail(TR_RANGE); return false; }
         target=(int32_t)delta;
-        /* secant speed makes each sampled position land in one tick. */
         delta=abs64((int64_t)target-m->last_sent);
         rpm=(uint16_t)((delta*60000000LL+16384LL*TR_TICK_US-1)/(16384LL*TR_TICK_US));
         if(rpm>TR_MAX_RPM) { fail(TR_RANGE); return false; }
@@ -705,9 +709,6 @@ static bool stream_tick(void)
             m->last_sent=target; m->last_sample_us=sample; continue;
         }
         m->cruise_until_us=0;
-        /* A linear profile section needs only one native constant-speed command.
-         * Keep sampling the reference locally; resume wire updates for braking.
-         * This is exact for the constant-speed section, not a slower fallback. */
         {
             float elapsed=(float)(sample-m->start_us)*0.000001f;
             TrProfile *p=&m->profile;
@@ -719,36 +720,29 @@ static bool stream_tick(void)
                 m->cruise_until_us=m->start_us+(uint32_t)((p->ta+p->tv)*1000000.0f);
             }
         }
-        /* The host API and installed EMM firmware use absolute encoder
-         * coordinates for the UART position command. */
-        if(!MOTOR_IS_FINGER(i+1)) {
-            /* Arm EMMs are single-round absolute position devices. Keep the
-             * host's multi-turn coordinate model, but transmit the equivalent
-             * angle in the drive's 0..16383 range. */
-            int32_t wrapped=wire_target%16384L;
-            if(wrapped<0) wrapped+=16384L;
-            wire_target=wrapped;
-        }
+        /* Do not wrap arm coordinates to one revolution. X42S 0x36 is a
+         * multi-turn coordinate (65536 feedback units/rev), and the original
+         * host intentionally carries revolution information in its 16384-count
+         * absolute targets. tr_counts_to_pulses() performs the only required
+         * 16384 -> 3200 (at 16 microsteps) command conversion. */
         pulses=tr_counts_to_pulses(i,wire_target);
         packet[n++]=i+1; packet[n++]=0xFD;
         packet[n++]=pulses<0 ? 1 : 0;
         put_be16(packet+n,rpm); n+=2;
-        packet[n++]=0; /* STM32 generates acceleration. */
+        packet[n++]=0;
         put_be32(packet+n,(uint32_t)abs64(pulses)); n+=4;
-        packet[n++]=1; /* absolute motor coordinate */
-        packet[n++]=0; /* AA batch: no unsolicited reached replies */
+        packet[n++]=1;
+        packet[n++]=0;
         packet[n++]=0x6B;
         m->last_sent=target; m->last_sample_us=sample;
     }
     if(n==4) return true;
-    /* X42S firmware accepts the native FD frame reliably for a single axis;
-     * reserve the AA envelope for true multi-axis batches. */
     if(n==17) {
         if(!send_bus(BUS_STREAM,packet[4],0xFD,4,0,packet+4,13)) return false;
         tr_diag.stream_packets++;
         return true;
     }
-    packet[n++]=0x6B; put_be16(packet+2,n); /* AA uses a TWO-byte length. */
+    packet[n++]=0x6B; put_be16(packet+2,n);
     if(!send_bus(BUS_STREAM,1,0xFD,4,0,packet,n)) return false;
     tr_diag.stream_packets++;
     return true;
@@ -766,40 +760,27 @@ static void check_motion(void)
         settled=due(m->finish_us) && (int32_t)(m->pos_us-m->finish_us)>0 &&
                 (int32_t)(m->flags_us-m->finish_us)>0;
         if(s->home && (m->flags&4U)) {
-            /* EMM stall/limit feedback is the homing stop signal. */
             m->active=2;
             continue;
         }
         clamp=MOTOR_IS_FINGER(i+1) && s->current<=TR_CLAMP_MAX_PERCENT && !s->home;
         if(s->home && stationary && abs64((int64_t)m->position-s->target)>TR_REACH_COUNTS) {
-            m->active=2; /* Stop is acknowledged before reporting home complete. */
+            m->active=2;
             continue;
         }
-        /* EMM V5 may leave its stall bit latched for one feedback sample
-         * after a home-stop. Position/settling checks below provide the
-         * reliable motion-stall decision; do not abort a valid retract on
-         * that stale bit. */
         if(!settled || s->end_rpm) continue;
-        /* EMM V5 position-reached is not asserted consistently on all
-         * firmware revisions. For homing, the measured encoder position and
-         * stationary state are authoritative once inside the tolerance. */
         if(abs64((int64_t)m->position-s->target)<=TR_REACH_COUNTS ||
            (clamp && stationary)) {
             m->holding=clamp ? 1 : 0;
             m->active=0; m->carry_rpm=0;
             m->head=(uint8_t)((m->head+1)%TR_QUEUE_SIZE); m->count--;
         } else if(now-m->finish_us>TR_SETTLE_US) {
-            /* Some EMM V5 revisions keep the reached/stall bits stale after
-             * a limit stop. Do not convert that stale status into a bridge
-             * transport fault; the command has already reached its bounded
-             * settle window and the next feedback sample remains visible. */
             m->holding=clamp ? 1 : 0;
             m->active=0; m->carry_rpm=0;
             m->head=(uint8_t)((m->head+1)%TR_QUEUE_SIZE); m->count--;
         }
     }
 }
-/* Admission estimate only. Actual lateness is checked independently each tick. */
 static bool spare_time(uint32_t us)
 {
     return !moving() || (int32_t)(next_tick-now)>(int32_t)us;
@@ -810,7 +791,6 @@ static void feedback_service(void)
     uint8_t i,field, oldest_id=0, oldest_field=0;
     uint32_t age, oldest=30000UL;
     TrMotor *m;
-    /* Status polling by the host must not starve another axis or its flags. */
     for(i=0;i<MOTOR_COUNT;i++) if(tr_motor[i].enabled) {
         m=&tr_motor[i];
         age=(m->valid&1) ? now-m->pos_us : TR_FEEDBACK_US;
@@ -820,7 +800,6 @@ static void feedback_service(void)
     }
     if(request.kind==2) {
         m=&tr_motor[request.id];
-        /* A status request forces a position newer than the request itself. */
         if(!global_fault && fresh(m) &&
            (int32_t)(m->pos_us-request.since)>=0) {
             uint8_t id=request.id; request.kind=0; reply(0,id+1); return;
@@ -841,7 +820,6 @@ static void feedback_service(void)
     }
     if(!spare_time(3600)) return;
     if(oldest_id) { read_bus(BUS_FEEDBACK,oldest_id,functions[oldest_field]); return; }
-    /* Alternate position and flags; slow environmental reads while idle. */
     for(i=0;i<MOTOR_COUNT;i++) {
         uint8_t id=(poll_motor+i)%MOTOR_COUNT;
         m=&tr_motor[id];
@@ -863,10 +841,7 @@ void tr_init(uint32_t t)
     memset(tr_motor,0,sizeof(tr_motor)); memset(&tr_diag,0,sizeof(tr_diag));
     memset(&bus,0,sizeof(bus)); memset(&request,0,sizeof(request));
     host_used=motor_used=0; now=t; next_tick=t+TR_TICK_US; bus_free_us=t;
-    /* Startup origin triggering is exposed through the software's explicit
-     * homing command; leave the bus idle at reset so an unsolicited EMM
-     * origin reply cannot desynchronise the shared parser. */
-    global_fault=emergency=poll_motor=poll_field=reset_mask=0; group_id=0; startup_id=5;
+    global_fault=emergency=poll_motor=poll_field=0; group_id=0; startup_id=MOTOR_COUNT+1U;
 }
 void tr_poll(uint32_t t)
 {
@@ -875,15 +850,8 @@ void tr_poll(uint32_t t)
     now=t;
     if(bus.kind && due(bus.timeout_us)) {
         if(bus.kind==BUS_STARTUP) {
-            /* EMM 0x9A origin trigger is commonly write-only. Do not latch
-             * the whole translator when that optional acknowledgement is
-             * absent; advance to the next axis after the bounded wait. */
             startup_id++; bus.kind=0; bus_free_us=now+TR_BUS_GAP_US;
         } else if(bus.kind==BUS_FEEDBACK) {
-            /* A missing telemetry reply must not take down the whole bridge.
-             * One EMM on the shared UART can be powered or configured
-             * differently; discard only this sample so another motor's
-             * explicit status request can proceed. */
             uint8_t id=bus.id;
             tr_diag.timeouts++;
             if(id>=1 && id<=MOTOR_COUNT) tr_motor[id-1].valid=0;
@@ -891,26 +859,24 @@ void tr_poll(uint32_t t)
             if(request.kind==2 && request.id+1==id) {
                 request.kind=0; reply(TR_TIMEOUT,id);
             }
-        } else if(request.kind==3) {
-            /* EMM 0x0A current-position reset is write-only on some
-             * firmware revisions. Continue the four-motor sequence even if
-             * that motor does not emit the optional 4-byte acknowledgement. */
+        } else if(request.kind==3 && bus.kind==BUS_CONTROL) {
+            /* Only 0x0A is allowed to be write-only. Position/status reads are
+             * mandatory because they prove the new coordinate origin is usable. */
+            uint8_t fn=bus.function;
             bus.kind=0; bus_free_us=now+TR_BUS_GAP_US;
             tr_diag.timeouts++;
-            if(request.id>=MOTOR_COUNT) { request.kind=0; reply(TR_OK,0); }
+            if(fn==0x0A && request.step==0) {
+                request.step=1;
+            } else {
+                request.kind=0;
+                reply(TR_TIMEOUT,0);
+            }
         } else if(request.kind==4) {
-            /* Firmware identification is optional.  A missing 0x1F reply
-             * must release only this query; do not latch a global motor
-             * fault or strand later host commands behind BUSY. */
             bus.kind=0; bus_free_us=now+TR_BUS_GAP_US;
             tr_diag.timeouts++;
             request.kind=0;
             reply(TR_TIMEOUT,0);
         } else if(bus.kind==BUS_STREAM) {
-            /* AA synchronized motion acknowledgements are optional on EMM
-             * firmware. The complete two-axis batch is already on the bus;
-             * release the transaction without turning a missing ACK into a
-             * host-visible timeout or an unsynchronized retry. */
             bus.kind=0; bus_free_us=now+TR_BUS_GAP_US;
             tr_diag.timeouts++;
         } else {
@@ -918,13 +884,15 @@ void tr_poll(uint32_t t)
         }
     }
     if(request.kind==2 && now-request.since>100000UL) {
-        /* Keep the unchanged host API alive while a busy motor bus catches
-         * up.  Motion safety does not use this cached reply; check_motion()
-         * still requires fresh position/flags before completing a segment. */
         uint8_t id=request.id;
         request.kind=0;
         reply(0,id+1);
-    } else if(request.kind && now-request.since>900000UL) fail(TR_TIMEOUT);
+    } else if(request.kind && now-request.since>900000UL) {
+        uint8_t kind=request.kind;
+        request.kind=0;
+        if(kind==3) reply(TR_TIMEOUT,0);
+        else fail(TR_TIMEOUT);
+    }
     if(global_fault) {
         if(emergency && !bus.kind && tr_bus_idle() && due(bus_free_us)) {
             uint8_t stop[5]={0,0xFE,0x98,0,0x6B};
@@ -946,24 +914,17 @@ void tr_poll(uint32_t t)
         } else if(!bus.kind && tr_bus_idle() && due(bus_free_us)) {
             if(!moving()) next_tick=now;
             if(stream_tick()) next_tick=moving() ? next_tick+TR_TICK_US : now+TR_TICK_US;
-        } /* Keep a due tick pending until the bus is actually free. */
+        }
     }
     if(bus.kind || !tr_bus_idle() || !due(bus_free_us) || global_fault) return;
-    if(reset_mask) {
-        uint8_t i, reset[4];
-        for(i=0;i<MOTOR_COUNT;i++) if(reset_mask&(1U<<i)) break;
-        reset[0]=(uint8_t)(i+1); reset[1]=0x0A; reset[2]=0x6D; reset[3]=0x6B;
-        if(tr_bus_write(reset,4)) {
-            reset_mask&=(uint8_t)~(1U<<i);
-            bus_free_us=now+20000UL;
-        }
-        return;
-    }
     for(i=0;i<MOTOR_COUNT;i++) if(tr_motor[i].active==2 && spare_time(3600)) {
         uint8_t c[5]={0,0xFE,0x98,0,0x6B}; c[0]=i+1;
         send_bus(BUS_HOME_STOP,i+1,0xFE,4,0,c,5); return;
     }
-    if((request.kind==1 || request.kind==4) && spare_time(6500)) { control_service(); return; }
+    if((request.kind==1 || request.kind==3 || request.kind==4) && spare_time(6500)) {
+        control_service();
+        return;
+    }
     for(i=0;i<MOTOR_COUNT;i++) {
         TrMotor *m=&tr_motor[i];
         if(!m->active && m->count && group_at_heads(front(m)) &&
@@ -973,4 +934,3 @@ void tr_poll(uint32_t t)
     }
     feedback_service();
 }
-
