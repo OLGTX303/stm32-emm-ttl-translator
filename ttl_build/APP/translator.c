@@ -845,6 +845,13 @@ void tr_poll(uint32_t t)
             if(request.kind==2 && request.id+1==id) {
                 request.kind=0; reply(TR_TIMEOUT,id);
             }
+        } else if(request.kind==3) {
+            /* EMM 0x0A current-position reset is write-only on some
+             * firmware revisions. Continue the four-motor sequence even if
+             * that motor does not emit the optional 4-byte acknowledgement. */
+            bus.kind=0; bus_free_us=now+TR_BUS_GAP_US;
+            tr_diag.timeouts++;
+            if(request.id>=MOTOR_COUNT) { request.kind=0; reply(TR_OK,0); }
         } else {
             bus.kind=0; bus_free_us=now+TR_BUS_GAP_US; tr_diag.timeouts++; fail(TR_TIMEOUT);
         }
