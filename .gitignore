@@ -1,0 +1,17 @@
+# Generated firmware/build output
+ttl_build/build/
+ttl_build/PRJ/Objects/
+ttl_build/PRJ/Listings/
+ttl_build/PRJ/*.uvguix.*
+ttl_build/tests/__pycache__/
+software/__pycache__/
+**/*.pyc
+
+# Local IDE and analysis state
+.codegraph/
+.vscode/
+.idea/
+
+# Local logs and probe captures
+*.log
+*.tmp
