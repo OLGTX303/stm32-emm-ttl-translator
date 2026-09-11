@@ -8,7 +8,7 @@ TrDiagnostics tr_diag;
 static const int8_t direction[MOTOR_COUNT] = TR_DIRECTION_INITIALIZER;
 static const int32_t offset[MOTOR_COUNT] = TR_OFFSET_INITIALIZER;
 static uint32_t now, next_tick, group_id, bus_free_us;
-static uint8_t global_fault, emergency, poll_motor, poll_field, startup_id;
+static uint8_t global_fault, emergency, poll_motor, poll_field, startup_id, reset_mask;
 static uint8_t host_rx[128], motor_rx[64];
 static uint16_t host_used, motor_used;
 static uint32_t host_byte_us, motor_byte_us;
@@ -363,20 +363,11 @@ static void host_frame(const uint8_t *r, uint8_t n)
          * four EMM encoder origins with 0x0A/0x6D. */
         /* A stale explicit status request must not block this recovery
          * operation after a disconnected/reconnected motor bus. */
-        uint8_t reset[16];
-        uint8_t j;
         if(request.kind==2) request.kind=0;
         if(request.kind || bus.kind || !tr_bus_idle() || !due(bus_free_us)) {
             reply(TR_BUSY,0); return;
         }
-        /* Some fitted EMM revisions ignore address zero. Send explicit
-         * write-only frames to all four addresses, without waiting for ACKs. */
-        for(j=0;j<MOTOR_COUNT;j++) {
-            reset[4*j]=(uint8_t)(j+1); reset[4*j+1]=0x0A;
-            reset[4*j+2]=0x6D; reset[4*j+3]=0x6B;
-        }
-        if(!tr_bus_write(reset,16)) { reply(TR_UART,0); return; }
-        bus_free_us=now+TR_BUS_GAP_US;
+        reset_mask=(uint8_t)((1U<<MOTOR_COUNT)-1U);
         reply(TR_OK,0);
         return;
     }
@@ -844,7 +835,7 @@ void tr_init(uint32_t t)
     /* Startup origin triggering is exposed through the software's explicit
      * homing command; leave the bus idle at reset so an unsolicited EMM
      * origin reply cannot desynchronise the shared parser. */
-    global_fault=emergency=poll_motor=poll_field=0; group_id=0; startup_id=5;
+    global_fault=emergency=poll_motor=poll_field=reset_mask=0; group_id=0; startup_id=5;
 }
 void tr_poll(uint32_t t)
 {
@@ -919,6 +910,16 @@ void tr_poll(uint32_t t)
         } /* Keep a due tick pending until the bus is actually free. */
     }
     if(bus.kind || !tr_bus_idle() || !due(bus_free_us) || global_fault) return;
+    if(reset_mask) {
+        uint8_t i, reset[4];
+        for(i=0;i<MOTOR_COUNT;i++) if(reset_mask&(1U<<i)) break;
+        reset[0]=(uint8_t)(i+1); reset[1]=0x0A; reset[2]=0x6D; reset[3]=0x6B;
+        if(tr_bus_write(reset,4)) {
+            reset_mask&=(uint8_t)~(1U<<i);
+            bus_free_us=now+20000UL;
+        }
+        return;
+    }
     for(i=0;i<MOTOR_COUNT;i++) if(tr_motor[i].active==2 && spare_time(3600)) {
         uint8_t c[5]={0,0xFE,0x98,0,0x6B}; c[0]=i+1;
         send_bus(BUS_HOME_STOP,i+1,0xFE,4,0,c,5); return;
