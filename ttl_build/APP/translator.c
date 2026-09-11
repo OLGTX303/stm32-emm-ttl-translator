@@ -694,6 +694,14 @@ static bool stream_tick(void)
         }
         /* The host API and installed EMM firmware use absolute encoder
          * coordinates for the UART position command. */
+        if(!MOTOR_IS_FINGER(i+1)) {
+            /* Arm EMMs are single-round absolute position devices. Keep the
+             * host's multi-turn coordinate model, but transmit the equivalent
+             * angle in the drive's 0..16383 range. */
+            int32_t wrapped=wire_target%16384L;
+            if(wrapped<0) wrapped+=16384L;
+            wire_target=wrapped;
+        }
         pulses=tr_counts_to_pulses(i,wire_target);
         packet[n++]=i+1; packet[n++]=0xFD;
         packet[n++]=pulses<0 ? 1 : 0;
