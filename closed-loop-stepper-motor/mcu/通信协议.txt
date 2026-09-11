@@ -1,0 +1,91 @@
+===== 主机→电机控制器数据帧格式 =====
+[字头]             uint16_t 固定值0xFFFF（2字节）
+[数据长度]         uint8_t len（1字节），指整个数据包的总长度（含0xFFFF和CRC8）
+[指令类型 + ID号]   1字节：
+                   - 低4bit：设备ID（1-4），0表示广播
+                   - 高4bit：指令类型（0-6）
+[数据]             uint8_t data[可变]
+[CRC8]             uint8_t 校验值（计算范围：从字头开始到本字段前的所有字节）
+
+===== 电机控制器→主机数据帧格式 =====
+[字头]             uint16_t 固定值0xFFFF（2字节）
+[数据长度]         uint8_t len（1字节）
+[标志位]           uint8_t 固定0xFF（表示响应帧）
+[数据]             uint8_t data[可变]
+[CRC8]             uint8_t 校验值（计算范围同上）
+
+===== 指令类型定义 =====
+0x0 (STAT)：状态查询
+  主机发送：无数据字段（len=5）
+  响应数据（12字节）：
+    [0] cmd_count  : uint8_t  历史指令计数（0-255循环）
+    [1-2] max_error: uint16_t 最大控制误差（小端序）
+    [3-4] fifo_status: uint16_t 
+             - bit15：运动状态（1=运行，0=停止）
+             - bit14：堵转（1=堵转，0=正常）
+             - bit0-13：FIFO剩余空间
+    [5] temperature: int8_t   温度值（℃）
+    [6-9] pos      : int32_t  当前位置（小端序）
+    [10-11] voltage: int16_t  电源电压（mV，小端序）
+
+0x1 (ENABLE)：使能电机
+  主机发送：无数据字段（len=5）
+  响应：ID非广播时返回ACK（len=5）
+
+0x2 (DISABLE)：禁用电机
+  主机发送：无数据字段（len=5）
+  响应：同上
+
+0x3 (RESET)：复位控制板
+  主机发送：无数据字段（len=5）
+  响应：同上
+
+0x4 (CLEAR_FIFO)：清空FIFO
+  主机发送：无数据字段（len=5）
+  响应：同上
+
+0x5 (SYNC)：同步控制
+  主机发送：数据字段（1字节）：
+    [0] control_flags: 
+          bit7：堵转时暂停（1=暂停）
+          bit1-4：设备掩码（bit0保留，bit1=设备1，bit2=设备2...）
+  响应：广播控制多个电机时没有回复
+
+0x6 (FIFO)：写入运动数据
+  主机发送：数据字段为压缩后的梯形位置序列（长度≥3）
+  响应：写入成功且ID非广播时返回ACK
+
+===== 堵转控制说明 =====
+当SYNC指令中对应设备的bit被置位时：
+  - 启用梯形运动控制（foc_ctrl.trap_run = true）
+  - 堵转暂停：foc_ctrl.stop_when_block = (control_flags>>7)&1
+  - 电流减半：foc_ctrl.half_current_when_block = (control_flags>>6)&1
+  - 最大电流：foc_ctrl.max_current = (MAX_CURRENT * max_current) / 100
+
+===== 校验算法 =====
+CRC8多项式：0x07
+计算范围：从字头(0xFF)开始到CRC8前最后一字节
+示例代码：
+static uint8_t crc8(uint8_t *datagram, int datagramLength)
+{
+    int i, j;
+    uint8_t currentByte;
+    uint8_t crc = 0;
+    for (i = 0; i < datagramLength; i++)
+    {                              // Execute for all bytes of a message
+        currentByte = datagram[i]; // Retrieve a byte to be sent from Array
+        for (j = 0; j < 8; j++)
+        {
+            if ((crc >> 7) ^ (currentByte & 0x01)) // update CRC based result of XOR operation
+            {
+                crc = (crc << 1) ^ 0x07;
+            }
+            else
+            {
+                crc = (crc << 1);
+            }
+            currentByte = currentByte >> 1;
+        } // for CRC bit
+    }
+    return crc;
+}
